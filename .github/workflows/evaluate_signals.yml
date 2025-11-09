@@ -1,8 +1,6 @@
 name: evaluate_signals (hora a hora)
 
-on:
-  schedule:
-    - cron: "0 * * * *"       # roda em HH:00 (UTC)
+
   workflow_dispatch:
 
 jobs:
