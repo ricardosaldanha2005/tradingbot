@@ -8,27 +8,26 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 4
+    concurrency:
+      group: fetch_and_push
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Instalar dependências
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Executar script
+      - name: Executar (limite 180s)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
-          BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
-          DISABLE_BINANCE: '1'
-        run: python fetch_and_push.py
+          UNIVERSE_TABLE: universe
+          UNIVERSE_ONLY_ACTIVE: "1"
+          UNIVERSE_ACTIVE_COL: enabled
+          # se quiseres testar sem Binance:
+          DISABLE_BINANCE: "1"
+        run: timeout 180s python fetch_and_push.py || true
+
 
