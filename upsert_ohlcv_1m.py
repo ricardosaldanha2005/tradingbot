@@ -55,6 +55,7 @@ RUN_IMMEDIATE = int(os.getenv("RUN_IMMEDIATE", "1"))
 
 # Se quiseres forçar um único exchange via env (senão lê da universe.linha.exchange)
 DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "").strip() or None
+DISABLE_BINANCE = os.getenv("DISABLE_BINANCE", "0") == "1"
 
 LOG_PREFIX = "[upsert_ohlcv_1m]"
 
@@ -223,6 +224,9 @@ def main_loop():
                 by_ex: dict[str, List[str]] = {}
                 for u in universe:
                     ex = (DEFAULT_EXCHANGE or (u.get("exchange") or "binance")).lower()
+                    if DISABLE_BINANCE and ex in ("binance", "binance_spot"):
+                        # Evita falhas em runners com geo-restrição (HTTP 451 da Binance)
+                        continue
                     sym = u["symbol"]
                     by_ex.setdefault(ex, []).append(sym)
 
