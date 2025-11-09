@@ -2,7 +2,7 @@ name: fetch_and_push (cada 5 min)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"    # corre a cada 5 minutos
+    - cron: "*/5 * * * *"    # roda a cada 5 minutos
   workflow_dispatch:          # permite executar manualmente
 
 jobs:
@@ -14,9 +14,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Instalar dependências
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Executar script
         env:
@@ -25,3 +29,4 @@ jobs:
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
         run: python fetch_and_push.py
+
