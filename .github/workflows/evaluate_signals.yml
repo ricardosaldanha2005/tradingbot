@@ -1,0 +1,26 @@
+name: evaluate_signals (hora a hora)
+
+on:
+  schedule:
+    - cron: "0 * * * *"       # corre à HH:00 (UTC)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # adiciona aqui outros segredos se o script usar (ex.: TELEGRAM_TOKEN, etc.)
+        run: python evaluate_signals.py
