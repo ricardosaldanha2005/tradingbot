@@ -40,6 +40,7 @@ SCHED_MODE     = os.getenv("SCHED_MODE", "ALIGN_1H").upper()  # ALIGN_1H | FIXED
 FIXED_SECONDS  = int(os.getenv("FIXED_SECONDS", "300"))
 ALIGN_DELAY_S  = int(os.getenv("ALIGN_DELAY_S", "60"))
 RUN_IMMEDIATE  = os.getenv("RUN_IMMEDIATE", "0") == "1"
+DISABLE_BINANCE = os.getenv("DISABLE_BINANCE", "0") == "1"
 
 MAX_BACKOFF_S  = int(os.getenv("MAX_BACKOFF_S", "300"))
 
@@ -184,6 +185,9 @@ def sb_get_universe() -> List[Dict[str, Any]]:
         ex = str(r["exchange"]).lower().strip()
         sy = str(r["symbol"]).strip()
         tf = str(r["timeframe"]).lower().strip()
+        if DISABLE_BINANCE and ex in ("binance", "binance_spot"):
+            # Evita falhas em ambientes restritos (ex.: runners do GitHub) onde Binance retorna 451
+            continue
         out.append({"exchange": ex, "symbol": sy, "timeframe": tf})
     return out
 

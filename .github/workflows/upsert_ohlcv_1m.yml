@@ -28,5 +28,6 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           BINANCE_KEY: ${{ secrets.BINANCE_KEY }}
           BINANCE_SECRET: ${{ secrets.BINANCE_SECRET }}
+          DISABLE_BINANCE: '1'
         run: python upsert_ohlcv_1m.py
 
