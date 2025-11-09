@@ -27,7 +27,7 @@ jobs:
           UNIVERSE_ONLY_ACTIVE: "1"
           UNIVERSE_ACTIVE_COL: enabled
           # se quiseres testar sem Binance:
-          DISABLE_BINANCE: "1"
+          DISABLE_BINANCE: "0"
         run: timeout 180s python fetch_and_push.py || true
 
 
