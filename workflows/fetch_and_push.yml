@@ -1,0 +1,51 @@
+name: fetch_and_push (*/5)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # corre de 5 em 5 min (UTC)
+  workflow_dispatch:         # permite correr manualmente
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    concurrency:
+      group: fetch_and_push
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Validar segredos
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+        run: |
+          test -n "$SUPABASE_URL" || (echo "Falta SUPABASE_URL" && exit 1)
+          test -n "$SUPABASE_SERVICE_ROLE" || (echo "Falta SUPABASE_SERVICE_ROLE" && exit 1)
+
+      - name: Executar (limite 150s)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          RAW_TABLE: raw_candles
+          FEAT_TABLE: features_snapshot
+          UNIVERSE_TABLE: universe
+          UNIVERSE_ONLY_ACTIVE: "1"
+          UNIVERSE_ACTIVE_COL: enabled
+          FETCH_SOURCE: ccxt
+          CANDLES_LIMIT: "200"
+          SCHED_MODE: ALIGN_1H
+          ALIGN_DELAY_S: "60"
+          RUN_IMMEDIATE: "1"
+          MAX_BACKOFF_S: "300"
+          DISABLE_BINANCE: "0"
+          TIMEFRAME: 1m
+        run: timeout 150s python fetch_and_push.py || true
