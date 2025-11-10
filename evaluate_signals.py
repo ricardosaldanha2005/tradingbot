@@ -210,14 +210,14 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
             if hit_sl_or_be:
                 if status in ("tp1", "tp2"):
                     # Fecho do remanescente a break-even (após parciais): lucro total = só parciais
-                    exit_level = "breakeven"
+                    exit_level = "be"
                     exit_at = ts
                     status = "close"
                     log_event(
                         sid, "closed", entry, ts,
                         details={
                             "reason": "breakeven_after_partial",
-                            "exit_level": "breakeven",
+                            "exit_level": "be",
                             "policy": POLICY_VERSION
                         }
                     )
@@ -267,14 +267,14 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
 
             if hit_sl_or_be:
                 if status in ("tp1", "tp2"):
-                    exit_level = "breakeven"
+                    exit_level = "be"
                     exit_at = ts
                     status = "close"
                     log_event(
                         sid, "closed", entry, ts,
                         details={
                             "reason": "breakeven_after_partial",
-                            "exit_level": "breakeven",
+                            "exit_level": "be",
                             "policy": POLICY_VERSION
                         }
                     )
@@ -328,7 +328,7 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
             r_mult = r_at(sl_working, entry, stop_initial, dire)
         elif exit_level == "tp3":
             r_mult = partial_profit
-        elif exit_level == "breakeven":
+        elif exit_level == "be":
             r_mult = partial_profit
         else:
             r_mult = partial_profit
