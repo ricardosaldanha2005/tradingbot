@@ -99,15 +99,42 @@ def fetch_candles_1m(exchange: str, symbol: str, start_iso: str, end_iso: str) -
 
 def log_event(signal_id: str, event: str, price: Optional[float], candle_ts: Optional[str],
               src: str = "1m", details: Optional[Dict[str, Any]] = None):
-    supabase.table(EVENTS_TABLE).insert({
-        "signal_id": signal_id,
-        "event": event,
-        "price": price,
-        "candle_start": candle_ts,
-        "candle_timeframe": "1m",
-        "src_timeframe": src,
-        "details": details or {}
-    }).execute()
+    """Idempotente p/ eventos únicos (entered, hit_tp*, hit_sl, closed)."""
+    UNIQUE_EVENTS = {"entered","hit_tp1","hit_tp2","hit_tp3","hit_sl","closed"}
+
+    try:
+        if event in UNIQUE_EVENTS:
+            exists = (supabase.table(EVENTS_TABLE)
+                      .select("id").eq("signal_id", signal_id)
+                      .eq("event", event).limit(1)
+                      .execute().data)
+            if exists:
+                return
+
+        supabase.table(EVENTS_TABLE).insert({
+            "signal_id": signal_id,
+            "event": event,
+            "price": price,
+            "candle_start": candle_ts,
+            "candle_timeframe": "1m",
+            "src_timeframe": src,
+            "details": details or {}
+        }).execute()
+
+    except Exception as e:
+        # corrida: já existe → ignora
+        if "uq_signal_event_unique" in str(e) or "duplicate key value" in str(e):
+            return
+        # outros erros → regista como 'error' sem bloquear
+        try:
+            supabase.table(EVENTS_TABLE).insert({
+                "signal_id": signal_id,
+                "event": "error",
+                "details": {"msg": str(e)}
+            }).execute()
+        except:
+            pass
+
 
 def compute_mfe_mae(dire: str, entry: float, hi: float, lo: float) -> Tuple[float, float]:
     if dire == "BUY":
