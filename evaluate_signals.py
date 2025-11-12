@@ -249,10 +249,11 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
                         }
                     )
                 else:
-                    status = "sl"
-                    exit_level = "sl"
-                    exit_at = ts
-                    log_event(sid, "hit_sl", sl_working, ts, details={"policy": POLICY_VERSION})
+                status = "close"
+                exit_level = "sl"
+                exit_at = ts
+                log_event(sid, "hit_sl", sl_working, ts, details={"policy": POLICY_VERSION})
+                
                 break
 
             # TPs (podem realizar parciais)
@@ -306,7 +307,7 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
                         }
                     )
                 else:
-                    status = "sl"
+                    status = "close"
                     exit_level = "sl"
                     exit_at = ts
                     log_event(sid, "hit_sl", sl_working, ts, details={"policy": POLICY_VERSION})
