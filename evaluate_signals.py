@@ -375,6 +375,10 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
     # persistir SL movido para BE após TP1/TP2
     if status in ("tp1", "tp2") and sl_db != entry:
         update["stop_loss"] = entry
+    # garantir que o SL fica em BE quando fechamos por BE (ou quando já passou por TP1/TP2)
+    if (exit_at and exit_level == "breakeven") or status in ("tp1", "tp2"):
+        update["stop_loss"] = entry
+
     if exit_at:
         update["exit_at"] = exit_at
         update["exit_level"] = exit_level
