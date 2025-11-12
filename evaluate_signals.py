@@ -73,7 +73,7 @@ def fetch_open_signals(limit: int = 500) -> List[Dict[str, Any]]:
     q2 = (supabase.table(SIGNALS_TABLE)
           .select("*")
           .eq("status", "open")
-          .is_("entered_at", "null")
+          .is_("entered_at", None)
           .order("created_at", desc=True)
           .limit(limit)
           .execute().data or [])
@@ -249,11 +249,10 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
                         }
                     )
                 else:
-                status = "close"
-                exit_level = "sl"
-                exit_at = ts
-                log_event(sid, "hit_sl", sl_working, ts, details={"policy": POLICY_VERSION})
-                
+                    status = "close"
+                    exit_level = "sl"
+                    exit_at = ts
+                    log_event(sid, "hit_sl", sl_working, ts, details={"policy": POLICY_VERSION})
                 break
 
             # TPs (podem realizar parciais)
@@ -354,9 +353,7 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
     if exit_at:
         if exit_level == "sl":
             r_mult = r_at(sl_working, entry, stop_initial, dire)
-        elif exit_level == "tp3":
-            r_mult = partial_profit
-        elif exit_level == "be":
+        elif exit_level in ("tp3", "be"):
             r_mult = partial_profit
         else:
             r_mult = partial_profit
@@ -377,7 +374,7 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
     if status in ("tp1", "tp2") and sl_db != entry:
         update["stop_loss"] = entry
     # garantir que o SL fica em BE quando fechamos por BE (ou quando já passou por TP1/TP2)
-    if (exit_at and exit_level == "breakeven") or status in ("tp1", "tp2"):
+    if (exit_at and exit_level == "be") or status in ("tp1", "tp2"):
         update["stop_loss"] = entry
 
     if exit_at:
