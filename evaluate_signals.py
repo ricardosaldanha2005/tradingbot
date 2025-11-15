@@ -41,6 +41,33 @@ TP1_FRAC = 0.33
 TP2_FRAC = 0.33
 TP3_FRAC = 0.34
 
+def pct_move(direction: str, entry: float, price: float) -> float:
+    if not entry or not price:
+        return 0.0
+    d = direction.upper()
+    if d == "BUY":
+        return (price / entry - 1.0) * 100.0
+    elif d == "SELL":
+        return (entry / price - 1.0) * 100.0
+    return 0.0
+
+
+def compute_profit_pct(direction: str, entry: float, partials: list[dict]) -> float:
+    """
+    partials = [
+      {"fraction": 0.33, "price": tp1_price},
+      {"fraction": 0.33, "price": tp2_price},
+      {"fraction": 0.34, "price": final_price},
+      ...
+    ]
+    """
+    total = 0.0
+    for p in partials:
+        frac = p["fraction"]
+        price = p["price"]
+        total += frac * pct_move(direction, entry, price)
+    return total
+
 
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
