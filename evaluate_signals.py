@@ -41,34 +41,6 @@ TP1_FRAC = 0.33
 TP2_FRAC = 0.33
 TP3_FRAC = 0.34
 
-def pct_move(direction: str, entry: float, price: float) -> float:
-    if not entry or not price:
-        return 0.0
-    d = direction.upper()
-    if d == "BUY":
-        return (price / entry - 1.0) * 100.0
-    elif d == "SELL":
-        return (entry / price - 1.0) * 100.0
-    return 0.0
-
-
-def compute_profit_pct(direction: str, entry: float, partials: list[dict]) -> float:
-    """
-    partials = [
-      {"fraction": 0.33, "price": tp1_price},
-      {"fraction": 0.33, "price": tp2_price},
-      {"fraction": 0.34, "price": final_price},
-      ...
-    ]
-    """
-    total = 0.0
-    for p in partials:
-        frac = p["fraction"]
-        price = p["price"]
-        total += frac * pct_move(direction, entry, price)
-    return total
-
-
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -375,15 +347,24 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
         if mae_worst is None or mae < mae_worst:
             mae_worst = mae
 
-    # 3) Se fechou, calcula R final (já temos partial_profit acumulado)
+    # 3) Se fechou, calcula R final (já temos partial_profit acumulado) e profit_pct
     r_mult: Optional[float] = None
+    profit_pct: Optional[float] = None
+
     if exit_at:
         if exit_level == "sl":
+            # SL direto: R calculado pelo preço onde bateu o SL (sl_working)
             r_mult = r_at(sl_working, entry, stop_initial, dire)
-        elif exit_level in ("tp3", "be"):
-            r_mult = partial_profit
         else:
+            # TP3 ou BE após parciais (ou outros casos de fecho): soma dos R das parciais
             r_mult = partial_profit
+
+        # converte R → % de movimento de preço
+        if r_mult is not None and entry:
+            # risco em % do preço (baseado no SL inicial)
+            risk_pct = abs(stop_initial - entry) / entry * 100.0
+            profit_pct = r_mult * risk_pct
+
 
     # 4) Persistir alterações ao sinal
     update: Dict[str, Any] = {
@@ -408,6 +389,10 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
         update["exit_at"] = exit_at
         update["exit_level"] = exit_level
         update["r_multiple"] = r_mult
+        update["finalized"] = True
+        if profit_pct is not None:
+            update["profit_pct"] = profit_pct
+
 
     supabase.table(SIGNALS_TABLE).update(update).eq("id", sid).execute()
 
