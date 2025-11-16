@@ -219,12 +219,16 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
                 # ainda não entrou, segue p/ próximo minuto
                 continue
 
-        # 2) Posição ativa: prioridade SL/BE antes de TPs no mesmo minuto (conservador)
-        #    Regras de BE:
-        #    - Após TP1: move SL para entry (break-even do remanescente)
-        #    - Após TP2: mantém SL no entry (remanescente protegido)
-        if status in ("tp1", "tp2"):
-            sl_working = entry  # break-even do remanescente
+    # 2) Posição ativa: prioridade SL/BE antes de TPs no mesmo minuto (conservador)
+    #    Nova política:
+    #    - Após TP1: SL = entry  (BE do remanescente)
+    #    - Após TP2: SL = tp1    (trailing stop no TP1)
+    if status == "tp1":
+        sl_working = entry
+    elif status == "tp2":
+        sl_working = tp1
+    else:
+        sl_working = sl_db
 
         if dire == "BUY":
             hit_sl_or_be = (lo <= sl_working)
@@ -378,12 +382,19 @@ def apply_state_machine(sig: Dict[str, Any]) -> None:
     }
     if entered_at:
         update["entered_at"] = entered_at
-    # persistir SL movido para BE após TP1/TP2
-    if status in ("tp1", "tp2") and sl_db != entry:
-        update["stop_loss"] = entry
-    # garantir que o SL fica em BE quando fechamos por BE (ou quando já passou por TP1/TP2)
-    if (exit_at and exit_level == "be") or status in ("tp1", "tp2"):
-        update["stop_loss"] = entry
+    # definir SL conforme o estado (trailing)
+    new_stop = None
+    if status == "tp1":
+        new_stop = entry          # BE
+    elif status == "tp2":
+        new_stop = tp1            # trailing para TP1
+
+    # se o trade fechou por BE (SL = entry após TP1), garante que fica registado assim
+    if exit_at and exit_level == "be":
+        new_stop = entry
+
+    if new_stop is not None and new_stop != sl_db:
+        update["stop_loss"] = new_stop
 
     if exit_at:
         update["exit_at"] = exit_at
