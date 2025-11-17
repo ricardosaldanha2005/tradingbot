@@ -2,8 +2,10 @@
 #
 # Lê o último sinal da tabela 'signals' e envia uma ordem LIMIT Spot
 # para a Binance TESTNET, com quantity calculada com base no risco.
-#
-# CUIDADO: isto já manda ordens reais PARA A TESTNET (não é só preview).
+# Depois guarda em 'signals':
+#  - binance_symbol
+#  - binance_entry_order_id
+#  - exchange_sync_status = 'entry_placed'
 
 import os
 import time
@@ -91,6 +93,29 @@ def fetch_latest_signal(sb: Client) -> Optional[Signal]:
         tp1=to_float(row.get("tp1")),
         stop_loss=to_float(row.get("stop_loss")),
         status=row.get("status"),
+    )
+
+
+def mark_entry_placed(
+    sb: Client,
+    signal_id: Any,
+    binance_symbol: str,
+    entry_order_id: int,
+) -> None:
+    """
+    Atualiza o sinal com info da Binance para o entry.
+    """
+    update_data = {
+        "binance_symbol": binance_symbol,
+        "binance_entry_order_id": entry_order_id,
+        "exchange_sync_status": "entry_placed",
+    }
+
+    (
+        sb.table(SIGNALS_TABLE)
+        .update(update_data)
+        .eq("id", signal_id)
+        .execute()
     )
 
 
@@ -276,7 +301,6 @@ def main() -> None:
 
     notional = qty * signal.entry
 
-    # Determinar lado da ordem
     if signal.direction not in ("BUY", "SELL"):
         raise SystemExit(f"Unexpected direction in signal: {signal.direction!r}")
 
@@ -288,7 +312,7 @@ def main() -> None:
     print(f"Notional  : {notional}")
     print("================================")
 
-    # Aqui enviamos MESMO a ordem para a TESTNET
+    # Enviar ordem
     resp = place_spot_limit_order(
         symbol=binance_symbol,
         side=signal.direction,
@@ -298,6 +322,17 @@ def main() -> None:
 
     print("\n=== BINANCE RESPONSE ===")
     print(resp)
+
+    # Guardar info da ordem de entrada na tabela 'signals'
+    entry_order_id = int(resp["orderId"])
+    print(f"\n-> Updating signal {signal.id} with entry order id {entry_order_id}...")
+    mark_entry_placed(
+        sb=sb,
+        signal_id=signal.id,
+        binance_symbol=binance_symbol,
+        entry_order_id=entry_order_id,
+    )
+    print("Update done.")
 
 
 if __name__ == "__main__":
