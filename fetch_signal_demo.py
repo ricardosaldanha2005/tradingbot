@@ -1,4 +1,4 @@
-# pip install supabase==2.6.0 gotrue==2.4.2 storage3==0.7.6 httpx==0.27.2 python-dotenv teste
+# pip install supabase==2.6.0 gotrue==2.4.2 storage3==0.7.6 httpx==0.27.2 python-dotenv
 
 import os
 from typing import Any, Optional
@@ -24,25 +24,18 @@ def get_supabase_client() -> Client:
 
 def fetch_next_pending_signal(sb: Client) -> Optional[dict[str, Any]]:
     """
-    Vai buscar 1 sinal da tabela 'signals'.
-
-    Neste momento:
-      - filtra por status = 'open'
-      - ordena por created_at desc
-      - devolve o mais recente
-
-    Se não tiveres coluna 'status', remove o .eq("status", "open").
+    Vai buscar o sinal mais recente da tabela 'signals',
+    independentemente do status.
     """
     query = (
         sb.table(SIGNALS_TABLE)
         .select("*")
-        .eq("status", "open")          # se não tiveres esta coluna, apaga esta linha
         .order("created_at", desc=True)
         .limit(1)
     )
 
     res = query.execute()
-    data = res.data or []
+    data: list[dict[str, Any]] = res.data or []
     if not data:
         return None
     return data[0]
@@ -56,7 +49,7 @@ def main() -> None:
     signal = fetch_next_pending_signal(sb)
 
     if signal is None:
-        print("No signals found with the current filter.")
+        print("No signals found in table.")
         return
 
     print("Found signal:")
