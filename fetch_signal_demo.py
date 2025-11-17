@@ -14,16 +14,29 @@ SIGNALS_TABLE = os.getenv("SIGNALS_TABLE", "signals")
 
 
 def get_supabase_client() -> Client:
+    """
+    Cria o cliente Supabase usando URL e service role do .env.
+    """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
         raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE in env")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
 
 
 def fetch_next_pending_signal(sb: Client) -> Optional[dict[str, Any]]:
+    """
+    Vai buscar 1 sinal da tabela 'signals'.
+
+    Neste momento:
+      - filtra por status = 'open'
+      - ordena por created_at desc
+      - devolve o mais recente
+
+    Se não tiveres coluna 'status', remove o .eq("status", "open").
+    """
     query = (
         sb.table(SIGNALS_TABLE)
         .select("*")
-        .eq("sent_to_exchange", False)
+        .eq("status", "open")          # se não tiveres esta coluna, apaga esta linha
         .order("created_at", desc=True)
         .limit(1)
     )
@@ -39,11 +52,11 @@ def main() -> None:
     print("-> Connecting to Supabase...")
     sb = get_supabase_client()
 
-    print(f"-> Fetching 1 pending signal from table '{SIGNALS_TABLE}'...")
+    print(f"-> Fetching 1 signal from table '{SIGNALS_TABLE}'...")
     signal = fetch_next_pending_signal(sb)
 
     if signal is None:
-        print("No pending signals found (sent_to_exchange = false).")
+        print("No signals found with the current filter.")
         return
 
     print("Found signal:")
