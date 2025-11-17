@@ -221,24 +221,24 @@ def calculate_order_quantity(
 
 # ---------- ORDENS ----------
 
-def place_spot_limit_order(symbol: str, side: str, price: float, quantity: float) -> dict[str, Any]:
+def place_spot_limit_order(symbol: str, side: str, quantity: float) -> dict[str, Any]:
     """
-    Envia uma ordem LIMIT Spot com timeInForce GTC.
+    Envia uma ordem MARKET Spot (para testes), de forma a ser executada logo.
+    Nota: apesar do nome da função, aqui estamos a usar MARKET de propósito.
     """
     params: dict[str, Any] = {
         "symbol": symbol,
         "side": side,              # BUY ou SELL
-        "type": "LIMIT",
-        "timeInForce": "GTC",
+        "type": "MARKET",
         "quantity": f"{quantity:.8f}",
-        "price": f"{price:.8f}",
         "newOrderRespType": "FULL",
     }
 
-    print("-> Sending LIMIT order to Binance TESTNET...")
-    print(f"   {symbol} {side} qty={params['quantity']} price={params['price']}")
+    print("-> Sending MARKET order to Binance TESTNET (TEST MODE)...")
+    print(f"   {symbol} {side} qty={params['quantity']}")
     resp = signed_request("POST", "/api/v3/order", params)
     return resp
+
 
 
 # ---------- MAIN ----------
@@ -312,11 +312,10 @@ def main() -> None:
     print(f"Notional  : {notional}")
     print("================================")
 
-    # Enviar ordem
+    # Enviar ordem (MARKET para testar fill imediato)
     resp = place_spot_limit_order(
         symbol=binance_symbol,
         side=signal.direction,
-        price=signal.entry,
         quantity=qty,
     )
 
