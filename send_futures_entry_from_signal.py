@@ -370,71 +370,78 @@ def split_quantity_for_tps(
 
 def place_bracket_orders(
     symbol: str,
-    side_entry: str,
-    qty: Decimal,
+    direction: str,
+    entry: Decimal,
     stop_loss: Decimal,
-    tp1: Decimal,
-    tp2: Decimal,
-    tp3: Decimal,
-    step_size: Decimal,
-    min_qty: Decimal,
+    tp1: Optional[Decimal],
+    tp2: Optional[Decimal],
+    tp3: Optional[Decimal],
+    qty_str: str,
     qty_decimals: int,
 ) -> None:
     """
-    Cria:
-      - 1 STOP_MARKET de SL
-      - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
-
-    side_entry: BUY ou SELL (da posição inicial).
-    SL/TPs são na direção oposta (para fechar).
+    Cria as ordens bracket:
+      - 1 STOP_MARKET para SL (closePosition=true, sem reduceOnly, sem quantity)
+      - Até 3 LIMIT TPs com reduceOnly=true e quantity=qty_str
     """
-    side_entry = side_entry.upper()
-    if side_entry not in ("BUY", "SELL"):
-        raise ValueError(f"Invalid side_entry: {side_entry}")
-
-    side_close = "SELL" if side_entry == "BUY" else "BUY"
+    direction = direction.upper()
+    if direction not in ("BUY", "SELL"):
+        raise ValueError(f"Invalid direction for bracket orders: {direction}")
 
     print("-> Placing bracket orders (SL + TPs)...")
 
-    # STOP LOSS - usa closePosition=True para garantir que fecha tudo se bater
-    sl_params: Dict[str, Any] = {
-        "symbol": symbol,
-        "side": side_close,
-        "type": "STOP_MARKET",
-        "stopPrice": str(stop_loss),
-        "closePosition": True,
-        "workingType": "CONTRACT_PRICE",
-        "reduceOnly": True,
-    }
+    # -------------------
+    # STOP LOSS (STOP_MARKET, closePosition=true, SEM reduceOnly)
+    # -------------------
+    sl_side = "SELL" if direction == "BUY" else "BUY"
+    sl_price = stop_loss
 
     print("   Sending STOP_MARKET (SL) ...")
+
+    sl_params: Dict[str, Any] = {
+        "symbol": symbol,
+        "side": sl_side,
+        "type": "STOP_MARKET",
+        "stopPrice": str(sl_price),
+        "workingType": "CONTRACT_PRICE",
+        # regra Binance: se usas closePosition=true, NÃO mandas reduceOnly nem quantity
+        "closePosition": "true",
+    }
+
     sl_resp = signed_request("POST", "/fapi/v1/order", sl_params)
-    print("   SL response:")
-    print(sl_resp.json())
+    sl_data = sl_resp.json()
+    print("   SL order response:")
+    print(f"     orderId={sl_data.get('orderId')}, status={sl_data.get('status')}")
 
-    # TP ORDERS
-    # Decide quantas partes conseguimos (1–3)
-    tp_prices = [tp1, tp2, tp3]
-    qty_parts = split_quantity_for_tps(qty, min_qty, step_size)
+    # -------------------
+    # TAKE PROFITS (LIMIT, reduceOnly=true, COM quantity)
+    # -------------------
+    tp_side = "SELL" if direction == "BUY" else "BUY"
 
-    # Mapeia nº de partes aos TPs: se tivermos menos que 3, usamos os primeiros
-    usable_tps = tp_prices[: len(qty_parts)]
-
-    for i, (part_qty, tp_price) in enumerate(zip(qty_parts, usable_tps), start=1):
-        qty_str = format_quantity(part_qty, qty_decimals)
+    def send_tp(label: str, price: Optional[Decimal]) -> None:
+        if price is None:
+            return
+        print(f"   Sending TP {label} LIMIT ...")
         tp_params: Dict[str, Any] = {
             "symbol": symbol,
-            "side": side_close,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": str(tp_price),
+            "side": tp_side,
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "price": str(price),
             "quantity": qty_str,
-            "reduceOnly": True,
-            "workingType": "CONTRACT_PRICE",
+            "reduceOnly": "true",
+            # opcionalmente poderias usar workingType, mas aqui é LIMIT clássico
         }
-        print(f"   Sending TAKE_PROFIT_MARKET TP{i} (qty={qty_str}, price={tp_price}) ...")
         tp_resp = signed_request("POST", "/fapi/v1/order", tp_params)
-        print(f"   TP{i} response:")
-        print(tp_resp.json())
+        tp_data = tp_resp.json()
+        print(f"   TP{label} order response:")
+        print(f"     orderId={tp_data.get('orderId')}, status={tp_data.get('status')}")
+
+    # Enviar TPs se existirem
+    send_tp("1", tp1)
+    send_tp("2", tp2)
+    send_tp("3", tp3)
+
 
 
 # -----------------------------------------------------------------------------
