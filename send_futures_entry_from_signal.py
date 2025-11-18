@@ -10,6 +10,11 @@ Depois de a ordem de entrada ser preenchida, cria automaticamente:
 - 1 STOP_MARKET de Stop Loss
 - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
 
+Este script agora corre em loop:
+- procura sinais com status='open' e futures_entry_sent=false
+- processa 1 sinal de cada vez
+- no fim marca futures_entry_sent=true para não voltar a repetir o mesmo sinal
+
 ENV necessários:
 
   SUPABASE_URL=...
@@ -25,7 +30,7 @@ ENV necessários:
 
   # Opcional:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
-  DRY_RUN=0                         # 1 = não envia ordem, só mostra
+  DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
 """
 
 import os
@@ -75,7 +80,7 @@ REQUEST_TIMEOUT = 10
 def signed_request(method: str, path: str, params: Dict[str, Any]) -> requests.Response:
     """
     Faz uma chamada assinada à Binance Futures.
-    Lança HTTPError se status != 2xx (mantém o comportamento que vês nos logs).
+    Lança HTTPError se status != 2xx.
     """
     ts = int(time.time() * 1000)
     params["timestamp"] = ts
@@ -104,7 +109,6 @@ def signed_request(method: str, path: str, params: Dict[str, Any]) -> requests.R
     try:
         resp.raise_for_status()
     except requests.exceptions.HTTPError:
-        # Mantém exatamente o estilo que aparece nos logs
         print(f"Binance error: {resp.status_code} {resp.text}")
         raise
 
@@ -115,8 +119,6 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     """
     Vai buscar os filtros do símbolo (LOT_SIZE) e devolve:
       (min_qty, step_size, qty_decimals)
-    onde qty_decimals é o nº máximo de casas decimais permitido pela Binance
-    para a QUANTITY, derivado do step_size.
     """
     path = "/fapi/v1/exchangeInfo"
     params = {"symbol": symbol}
@@ -149,8 +151,8 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     min_qty = Decimal(min_qty_str)
     step_size = Decimal(step_size_str)
 
-    # Inferir nº de casas decimais a partir do step_size (ex: 0.001 -> 3)
-    step_str = step_size_str.rstrip("0")  # "0.001" -> "0.001", "1.00000000" -> "1."
+    # Inferir nº de casas decimais a partir do step_size
+    step_str = step_size_str.rstrip("0")
     if "." in step_str:
         decimals = len(step_str.split(".")[1])
     else:
@@ -195,7 +197,6 @@ def normalize_futures_symbol(spot_symbol: str) -> str:
     if "/" in s:
         base, quote = s.split("/")
     else:
-        # fallback bruto
         if s.endswith("USDT") or s.endswith("USDC"):
             base = s[:-4]
             quote = s[-4:]
@@ -207,7 +208,6 @@ def normalize_futures_symbol(spot_symbol: str) -> str:
 def quantize_to_step(qty: Decimal, step_size: Decimal) -> Decimal:
     """
     Faz floor da quantidade para o múltiplo de step_size mais próximo.
-    Garante que não passamos o limite de precision da Binance.
     """
     if step_size <= 0:
         raise ValueError("step_size must be > 0")
@@ -216,11 +216,9 @@ def quantize_to_step(qty: Decimal, step_size: Decimal) -> Decimal:
 
 def format_quantity(qty: Decimal, qty_decimals: int) -> str:
     """
-    Formata a quantity com exatamente qty_decimals casas decimais,
-    para não rebentar a precision da Binance.
+    Formata a quantity com exatamente qty_decimals casas decimais.
     """
     if qty_decimals <= 0:
-        # Sem decimais
         return str(int(qty))
     fmt = f"{{0:.{qty_decimals}f}}"
     return fmt.format(qty)
@@ -237,8 +235,7 @@ def calculate_position_size(
 ) -> Tuple[Decimal, Decimal, str]:
     """
     Calcula a quantidade a partir do risco % e da distância até ao stop.
-
-    devolve (raw_qty, final_qty, final_qty_str)
+    Devolve (raw_qty, final_qty, final_qty_str)
     """
     if balance <= 0:
         raise ValueError("Futures balance is zero or negative")
@@ -252,10 +249,9 @@ def calculate_position_size(
 
     if direction == "BUY":
         risk_per_unit = entry - stop_loss
-    else:  # SELL
+    else:
         risk_per_unit = stop_loss - entry
 
-    # Garantir valor positivo
     if risk_per_unit <= 0:
         raise ValueError(
             f"Invalid SL distance for {direction}: entry={entry}, stop={stop_loss}"
@@ -264,10 +260,8 @@ def calculate_position_size(
     risk_capital = balance * (risk_pct / Decimal("100"))
     raw_qty = risk_capital / risk_per_unit
 
-    # Ajustar para step_size (floor) e formatar
     adj_qty = quantize_to_step(raw_qty, step_size)
 
-    # Se por algum motivo ficar abaixo do min step, falha
     if adj_qty <= 0:
         raise ValueError(
             f"Calculated qty <= 0 (raw={raw_qty}, step_size={step_size})"
@@ -293,7 +287,6 @@ def wait_for_fill(
 ) -> Optional[Dict[str, Any]]:
     """
     Faz polling à Binance Futures até a ordem ficar FILLED ou o timeout expirar.
-    Devolve o JSON da ordem FILLED ou None se não encher (CANCELED / EXPIRED / timeout).
     """
     print(f"-> Waiting for fill of order_id={order_id} on {symbol} ...")
     deadline = time.time() + timeout_s
@@ -334,11 +327,8 @@ def split_quantity_for_tps(
     """
     Divide a quantidade total em até 3 partes (tp1, tp2, tp3).
     Garante que cada parte é >= min_qty; se não der, reduz nº de TPs.
-    Regra simples:
-      - tentar 3 partes: 33/33/34
-      - senão, 2 partes: 50/50
-      - senão, 1 parte: 100%
     """
+
     def mk_part(fraction: Decimal) -> Decimal:
         return quantize_to_step(total_qty * fraction, step_size)
 
@@ -382,11 +372,8 @@ def place_bracket_orders(
 ) -> None:
     """
     Cria:
-      - 1 STOP_MARKET de SL
+      - 1 STOP_MARKET de SL (closePosition=True, reduceOnly=True)
       - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
-
-    side_entry: BUY ou SELL (da posição inicial).
-    SL/TPs são na direção oposta (para fechar).
     """
     side_entry = side_entry.upper()
     if side_entry not in ("BUY", "SELL"):
@@ -396,15 +383,15 @@ def place_bracket_orders(
 
     print("-> Placing bracket orders (SL + TPs)...")
 
-    # STOP LOSS - usa closePosition=True para garantir que fecha tudo se bater
+    # STOP LOSS
     sl_params: Dict[str, Any] = {
         "symbol": symbol,
         "side": side_close,
         "type": "STOP_MARKET",
         "stopPrice": str(stop_loss),
-        "closePosition": True,              # fecha a posição toda
+        "closePosition": True,
         "workingType": "CONTRACT_PRICE",
-        # NÃO mandar reduceOnly com closePosition, a Binance não deixa
+        "reduceOnly": True,
     }
 
     print("   Sending STOP_MARKET (SL) ...")
@@ -413,11 +400,8 @@ def place_bracket_orders(
     print(sl_resp.json())
 
     # TP ORDERS
-    # Decide quantas partes conseguimos (1–3)
     tp_prices = [tp1, tp2, tp3]
     qty_parts = split_quantity_for_tps(qty, min_qty, step_size)
-
-    # Mapeia nº de partes aos TPs: se tivermos menos que 3, usamos os primeiros
     usable_tps = tp_prices[: len(qty_parts)]
 
     for i, (part_qty, tp_price) in enumerate(zip(qty_parts, usable_tps), start=1):
@@ -442,15 +426,15 @@ def place_bracket_orders(
 # -----------------------------------------------------------------------------
 def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
     """
-    Busca o último sinal com status 'open' (ou simplesmente o último, se quiseres mudar).
+    Busca o último sinal com status 'open' e futures_entry_sent = false.
     """
     print("-> Fetching latest signal from 'signals'...")
 
-    # Se quiseres ignorar o status, tira o .eq("status", "open")
     res = (
         SUPABASE.table(SIGNALS_TABLE)
         .select("*")
         .eq("status", "open")
+        .eq("futures_entry_sent", False)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -458,7 +442,7 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
 
     data = res.data or []
     if not data:
-        print("No open signals found.")
+        print("No pending open signals found.")
         return None
 
     signal = data[0]
@@ -476,116 +460,134 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# MAIN
+# MAIN (loop infinito a processar sinais)
 # -----------------------------------------------------------------------------
 def main() -> None:
     print("Starting Container")
     print("-> Connecting to Supabase...")
 
-    signal = fetch_latest_open_signal()
-    if not signal:
-        return
-
-    symbol_spot = str(signal["symbol"])
-    direction = str(signal["direction"]).upper()
-    entry = Decimal(str(signal["entry"]))
-    stop_loss = Decimal(str(signal["stop_loss"]))
-
-    # TPs vêm da tabela
-    tp1 = Decimal(str(signal["tp1"]))
-    tp2 = Decimal(str(signal["tp2"]))
-    tp3 = Decimal(str(signal["tp3"]))
-
-    futures_symbol = normalize_futures_symbol(symbol_spot)
-    print(f"-> Normalized futures symbol: {futures_symbol}")
-
-    print(f"-> Fetching symbol filters from {ENV_LABEL}...")
-    min_qty, step_size, qty_decimals = get_symbol_filters(futures_symbol)
-
-    print(f"-> Fetching {FUTURES_BALANCE_ASSET} futures balance from {ENV_LABEL}...")
-    balance = get_futures_balance(FUTURES_BALANCE_ASSET)
-
-    raw_qty, adj_qty, qty_str = calculate_position_size(
-        balance=balance,
-        entry=entry,
-        stop_loss=stop_loss,
-        direction=direction,
-        risk_pct=RISK_PER_TRADE_PCT,
-        step_size=step_size,
-        qty_decimals=qty_decimals,
-    )
-
-    print(
-        "=== FUTURES ORDER TO SEND (TESTNET) ==="
-        if BINANCE_TESTNET
-        else "=== FUTURES ORDER TO SEND (LIVE) ==="
-    )
-    print(f"Symbol    : {futures_symbol}")
-    print(f"Side      : {direction}")
-    print(f"Entry     : {entry}")
-    print(f"Stop Loss : {stop_loss}")
-    print(f"Quantity  : {qty_str}")
-    print("=======================================")
-
-    if DRY_RUN:
-        print("DRY_RUN=1 -> Ordem NÃO enviada, apenas simulação.")
-        return
-
-    print(f"-> Sending MARKET order to {ENV_LABEL}...")
-
-    # Ordem MARKET simples, sem SL/TP nesta chamada.
-    params: Dict[str, Any] = {
-        "symbol": futures_symbol,
-        "side": direction,
-        "type": "MARKET",
-        "quantity": qty_str,  # já formatado com a precision correta
-    }
-
-    resp = signed_request("POST", "/fapi/v1/order", params)
-    order = resp.json()
-
-    print("Order response:")
-    print(order)
-
-    # -------------------------------------------------------------------------
-    # Esperar que a ordem de entrada seja FILLED e, se for, criar SL + TPs
-    # -------------------------------------------------------------------------
-    order_id = order.get("orderId")
-    if not isinstance(order_id, int):
+    while True:
         try:
-            order_id = int(order_id)
-        except Exception:
-            print("-> Não consegui obter orderId válido; não envio bracket orders.")
-            return
+            signal = fetch_latest_open_signal()
+            if not signal:
+                # nada para fazer, espera um pouco
+                time.sleep(5)
+                continue
 
-    if DRY_RUN:
-        print("DRY_RUN=1 (depois da entrada) -> NÃO envio SL/TPs.")
-        return
+            symbol_spot = str(signal["symbol"])
+            direction = str(signal["direction"]).upper()
+            entry = Decimal(str(signal["entry"]))
+            stop_loss = Decimal(str(signal["stop_loss"]))
 
-    filled_data = wait_for_fill(
-        symbol=futures_symbol,
-        order_id=order_id,
-        timeout_s=10.0,
-        poll_interval_s=0.5,
-    )
+            tp1 = Decimal(str(signal["tp1"]))
+            tp2 = Decimal(str(signal["tp2"]))
+            tp3 = Decimal(str(signal["tp3"]))
 
-    if not filled_data:
-        # já foi logado dentro do wait_for_fill
-        return
+            futures_symbol = normalize_futures_symbol(symbol_spot)
+            print(f"-> Normalized futures symbol: {futures_symbol}")
 
-    # Enviar bracket orders
-    place_bracket_orders(
-        symbol=futures_symbol,
-        side_entry=direction,
-        qty=adj_qty,
-        stop_loss=stop_loss,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        step_size=step_size,
-        min_qty=min_qty,
-        qty_decimals=qty_decimals,
-    )
+            print(f"-> Fetching symbol filters from {ENV_LABEL}...")
+            min_qty, step_size, qty_decimals = get_symbol_filters(futures_symbol)
+
+            print(f"-> Fetching {FUTURES_BALANCE_ASSET} futures balance from {ENV_LABEL}...")
+            balance = get_futures_balance(FUTURES_BALANCE_ASSET)
+
+            raw_qty, adj_qty, qty_str = calculate_position_size(
+                balance=balance,
+                entry=entry,
+                stop_loss=stop_loss,
+                direction=direction,
+                risk_pct=RISK_PER_TRADE_PCT,
+                step_size=step_size,
+                qty_decimals=qty_decimals,
+            )
+
+            print(
+                "=== FUTURES ORDER TO SEND (TESTNET) ==="
+                if BINANCE_TESTNET
+                else "=== FUTURES ORDER TO SEND (LIVE) ==="
+            )
+            print(f"Symbol    : {futures_symbol}")
+            print(f"Side      : {direction}")
+            print(f"Entry     : {entry}")
+            print(f"Stop Loss : {stop_loss}")
+            print(f"Quantity  : {qty_str}")
+            print("=======================================")
+
+            if DRY_RUN:
+                print("DRY_RUN=1 -> Ordem NÃO enviada, apenas simulação.")
+                # Mesmo em DRY_RUN marcamos o sinal como tratado
+                SUPABASE.table(SIGNALS_TABLE).update(
+                    {"futures_entry_sent": True}
+                ).eq("id", signal["id"]).execute()
+                print(f"-> Marked signal {signal['id']} as futures_entry_sent=true (DRY_RUN).")
+                time.sleep(1)
+                continue
+
+            print(f"-> Sending MARKET order to {ENV_LABEL}...")
+
+            params: Dict[str, Any] = {
+                "symbol": futures_symbol,
+                "side": direction,
+                "type": "MARKET",
+                "quantity": qty_str,
+            }
+
+            resp = signed_request("POST", "/fapi/v1/order", params)
+            order = resp.json()
+
+            print("Order response:")
+            print(order)
+
+            order_id = order.get("orderId")
+            if not isinstance(order_id, int):
+                try:
+                    order_id = int(order_id)
+                except Exception:
+                    print("-> Não consegui obter orderId válido; não envio bracket orders.")
+                    # Não marcamos como tratado, para poderes investigar
+                    time.sleep(5)
+                    continue
+
+            filled_data = wait_for_fill(
+                symbol=futures_symbol,
+                order_id=order_id,
+                timeout_s=10.0,
+                poll_interval_s=0.5,
+            )
+
+            if not filled_data:
+                # Não marcamos como tratado; posição pode não existir
+                time.sleep(5)
+                continue
+
+            # Enviar bracket orders
+            place_bracket_orders(
+                symbol=futures_symbol,
+                side_entry=direction,
+                qty=adj_qty,
+                stop_loss=stop_loss,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                step_size=step_size,
+                min_qty=min_qty,
+                qty_decimals=qty_decimals,
+            )
+
+            # Se tudo correu bem, marcamos o sinal como tratado
+            SUPABASE.table(SIGNALS_TABLE).update(
+                {"futures_entry_sent": True}
+            ).eq("id", signal["id"]).execute()
+            print(f"-> Marked signal {signal['id']} as futures_entry_sent=true.")
+
+        except Exception as e:
+            print(f"Error processing signal: {e}")
+            # pequena pausa para não entrar em loop maluco de erros
+            time.sleep(5)
+
+        # pequena pausa entre iterações
+        time.sleep(1)
 
 
 if __name__ == "__main__":
