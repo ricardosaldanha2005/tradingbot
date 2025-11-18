@@ -402,9 +402,9 @@ def place_bracket_orders(
         "side": side_close,
         "type": "STOP_MARKET",
         "stopPrice": str(stop_loss),
-        "closePosition": True,
+        "closePosition": True,              # fecha a posição toda
         "workingType": "CONTRACT_PRICE",
-        "reduceOnly": True,
+        # NÃO mandar reduceOnly com closePosition, a Binance não deixa
     }
 
     print("   Sending STOP_MARKET (SL) ...")
