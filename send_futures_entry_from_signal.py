@@ -376,109 +376,35 @@ def split_quantity_for_tps(
     return [total_adj]
 
 
-def place_bracket_orders(
-    symbol: str,
-    side_entry: str,
-    qty: Decimal,
-    stop_loss: Decimal,
-    tp1: Decimal,
-    tp2: Decimal,
-    tp3: Decimal,
-    step_size: Decimal,
-    min_qty: Decimal,
-    qty_decimals: int,
-) -> None:
-    """
-    Cria:
-      - 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True)
-      - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly com quantity fixa
-    Não usa closePosition em nenhum pedido.
-    """
-    side_entry = side_entry.upper()
-    if side_entry not in ("BUY", "SELL"):
-        raise ValueError(f"Invalid side_entry: {side_entry}")
-
-    side_close = "SELL" if side_entry == "BUY" else "BUY"
-
-    print("-> Placing bracket orders (SL + TPs)...")
-
-    # Ajustar a qty total à step_size por segurança
-    total_qty = quantize_to_step(qty, step_size)
-    if total_qty < min_qty:
-        raise ValueError(
-            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TP."
-        )
-
-    sl_qty_str = format_quantity(total_qty, qty_decimals)
-
-    # STOP LOSS (sem closePosition, com quantity + reduceOnly)
-    sl_params: Dict[str, Any] = {
-        "symbol": symbol,
-        "side": side_close,
-        "type": "STOP_MARKET",
-        "stopPrice": str(stop_loss),
-        "quantity": sl_qty_str,
-        "reduceOnly": True,
-        "workingType": "CONTRACT_PRICE",
-        "positionSide": "BOTH",
-    }
-
-    print(f"   Sending STOP_MARKET (SL) qty={sl_qty_str}, price={stop_loss} ...")
-    sl_resp = signed_request("POST", "/fapi/v1/order", sl_params)
-    print("   SL response:")
-    print(sl_resp.json())
-
-    # TP ORDERS
-    tp_prices = [tp1, tp2, tp3]
-    qty_parts = split_quantity_for_tps(total_qty, min_qty, step_size)
-    usable_tps = tp_prices[: len(qty_parts)]
-
-    for i, (part_qty, tp_price) in enumerate(zip(qty_parts, usable_tps), start=1):
-        part_qty_str = format_quantity(part_qty, qty_decimals)
-        tp_params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side_close,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": str(tp_price),
-            "quantity": part_qty_str,
-            "reduceOnly": True,
-            "workingType": "CONTRACT_PRICE",
-            "positionSide": "BOTH",
-        }
-        print(
-            f"   Sending TAKE_PROFIT_MARKET TP{i} (qty={part_qty_str}, price={tp_price}) ..."
-        )
-        tp_resp = signed_request("POST", "/fapi/v1/order", tp_params)
-        print(f"   TP{i} response:")
-        print(tp_resp.json())
-
-
 # -----------------------------------------------------------------------------
-# MARKET order com retries de precisão
+# Função genérica de ordem com retries de precisão (para MARKET, SL e TPs)
 # -----------------------------------------------------------------------------
-def send_market_order_with_precision_retries(
+def send_order_with_precision_retries(
     symbol: str,
     side: str,
+    base_params: Dict[str, Any],
     qty: Decimal,
     qty_decimals: int,
 ) -> Dict[str, Any]:
     """
-    Envia uma ordem MARKET, tentando reduzir o nº de casas decimais na quantity
-    se a Binance devolver o erro:
+    Envia uma ordem (MARKET, STOP_MARKET, TAKE_PROFIT_MARKET, etc.), tentando
+    reduzir o nº de casas decimais na quantity se a Binance devolver o erro:
         "Precision is over the maximum defined for this asset."
     """
     last_error: Optional[Exception] = None
 
     for d in range(qty_decimals, -1, -1):
         qty_str = format_quantity(qty, d)
-        params: Dict[str, Any] = {
+        params = {
+            **base_params,
             "symbol": symbol,
             "side": side,
-            "type": "MARKET",
             "quantity": qty_str,
         }
 
-        print(f"-> Trying MARKET order with quantity={qty_str} (decimals={d}) ...")
+        print(
+            f"-> Trying {base_params.get('type')} order with quantity={qty_str} (decimals={d}) ..."
+        )
 
         try:
             resp = signed_request("POST", "/fapi/v1/order", params)
@@ -503,7 +429,110 @@ def send_market_order_with_precision_retries(
 
     if last_error:
         raise last_error
-    raise RuntimeError("Failed to send MARKET order due to unknown precision issue.")
+    raise RuntimeError("Failed to send order due to unknown precision issue.")
+
+
+# Wrapper específico para MARKET
+def send_market_order_with_precision_retries(
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    qty_decimals: int,
+) -> Dict[str, Any]:
+    base_params: Dict[str, Any] = {
+        "type": "MARKET",
+    }
+    return send_order_with_precision_retries(
+        symbol=symbol,
+        side=side,
+        base_params=base_params,
+        qty=qty,
+        qty_decimals=qty_decimals,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Bracket orders (SL + TPs) usando retries de precisão
+# -----------------------------------------------------------------------------
+def place_bracket_orders(
+    symbol: str,
+    side_entry: str,
+    qty: Decimal,
+    stop_loss: Decimal,
+    tp1: Decimal,
+    tp2: Decimal,
+    tp3: Decimal,
+    step_size: Decimal,
+    min_qty: Decimal,
+    qty_decimals: int,
+) -> None:
+    """
+    Cria:
+      - 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True)
+      - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly com quantity fixa
+
+    Usa send_order_with_precision_retries para lidar com a precisão de quantity.
+    """
+    side_entry = side_entry.upper()
+    if side_entry not in ("BUY", "SELL"):
+        raise ValueError(f"Invalid side_entry: {side_entry}")
+
+    side_close = "SELL" if side_entry == "BUY" else "BUY"
+
+    print("-> Placing bracket orders (SL + TPs)...")
+
+    # Ajustar a qty total à step_size por segurança
+    total_qty = quantize_to_step(qty, step_size)
+    if total_qty < min_qty:
+        raise ValueError(
+            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TP."
+        )
+
+    # STOP LOSS
+    sl_base_params: Dict[str, Any] = {
+        "type": "STOP_MARKET",
+        "stopPrice": str(stop_loss),
+        "reduceOnly": True,
+        "workingType": "CONTRACT_PRICE",
+        "positionSide": "BOTH",
+    }
+
+    print(f"   Sending STOP_MARKET (SL) qty≈{format_quantity(total_qty, qty_decimals)}, price={stop_loss} ...")
+    sl_resp = send_order_with_precision_retries(
+        symbol=symbol,
+        side=side_close,
+        base_params=sl_base_params,
+        qty=total_qty,
+        qty_decimals=qty_decimals,
+    )
+    print("   SL response:")
+    print(sl_resp)
+
+    # TP ORDERS
+    tp_prices = [tp1, tp2, tp3]
+    qty_parts = split_quantity_for_tps(total_qty, min_qty, step_size)
+    usable_tps = tp_prices[: len(qty_parts)]
+
+    for i, (part_qty, tp_price) in enumerate(zip(qty_parts, usable_tps), start=1):
+        tp_base_params: Dict[str, Any] = {
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": str(tp_price),
+            "reduceOnly": True,
+            "workingType": "CONTRACT_PRICE",
+            "positionSide": "BOTH",
+        }
+        print(
+            f"   Sending TAKE_PROFIT_MARKET TP{i} (qty≈{format_quantity(part_qty, qty_decimals)}, price={tp_price}) ..."
+        )
+        tp_resp = send_order_with_precision_retries(
+            symbol=symbol,
+            side=side_close,
+            base_params=tp_base_params,
+            qty=part_qty,
+            qty_decimals=qty_decimals,
+        )
+        print(f"   TP{i} response:")
+        print(tp_resp)
 
 
 # -----------------------------------------------------------------------------
