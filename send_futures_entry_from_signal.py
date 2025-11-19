@@ -2,24 +2,18 @@
 """
 send_futures_entry_from_signal.py
 
-Lê sinais 'open' da tabela 'signals' (Supabase) e envia
-ordens MARKET para a Binance Futures (TESTNET ou real),
+Lê sinais na tabela 'signals' do Supabase e envia
+ordens MARKET para a Binance FUTURES (TESTNET ou real),
 calculando a quantidade com base no risco por trade e no stop loss.
 
 Depois de a ordem de entrada ser preenchida, cria automaticamente:
 - 1 STOP_MARKET de Stop Loss
 - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
 
-Corre em loop:
+Este script corre em loop:
 - procura sinais com status='open' e futures_entry_sent=false
 - processa 1 sinal de cada vez
-- depois marca futures_entry_sent=true (se a entrada + SL/TP forem bem sucedidos)
-
-Campos usados na tabela 'signals':
-- futures_entry_sent      (boolean)
-- futures_symbol          (text)
-- futures_entry_order_id  (text ou bigint)
-- futures_entry_status    (text)
+- no fim marca futures_entry_sent=true para não voltar a repetir o mesmo sinal
 
 ENV necessários:
 
@@ -36,7 +30,7 @@ ENV necessários:
 
   # Opcional:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
-  DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca como tratado)
+  DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
 """
 
 import os
@@ -126,14 +120,7 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     Vai buscar:
       - LOT_SIZE.minQty
       - LOT_SIZE.stepSize
-      - quantityPrecision
-      - baseAssetPrecision
-
-    E calcula o nº máximo de casas decimais permitidas na QUANTITY como:
-
-        qty_decimals = min(decimais_do_step,
-                           quantityPrecision (se existir),
-                           baseAssetPrecision (se existir))
+      - quantityPrecision  -> nº máximo de casas decimais permitido na QUANTITY
 
     Devolve:
       (min_qty, step_size, qty_decimals)
@@ -177,24 +164,17 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     else:
         decimals_from_step = 0
 
-    quantity_precision = info.get("quantityPrecision")
-    base_asset_precision = info.get("baseAssetPrecision")
-
-    # Construir lista de candidatos e tirar o mínimo
-    candidates: List[int] = [decimals_from_step]
-
-    if quantity_precision is not None:
-        candidates.append(int(quantity_precision))
-
-    if base_asset_precision is not None:
-        candidates.append(int(base_asset_precision))
-
-    qty_decimals = min(candidates)
+    # Se existir quantityPrecision, usamos isso como limite "oficial"
+    qp = info.get("quantityPrecision")
+    if qp is not None:
+        qty_decimals = int(qp)
+    else:
+        qty_decimals = decimals_from_step
 
     print(f"  min_qty            : {min_qty_str}")
     print(f"  step_size          : {step_size_str}")
-    print(f"  quantityPrecision  : {quantity_precision}")
-    print(f"  baseAssetPrecision : {base_asset_precision}")
+    print(f"  quantityPrecision  : {info.get('quantityPrecision')}")
+    print(f"  baseAssetPrecision : {info.get('baseAssetPrecision')}")
     print(f"  qty_decimals used  : {qty_decimals}")
 
     return min_qty, step_size, qty_decimals
@@ -318,12 +298,11 @@ def calculate_position_size(
 def wait_for_fill(
     symbol: str,
     order_id: int,
-    timeout_s: float = 60.0,
-    poll_interval_s: float = 1.0,
+    timeout_s: float = 10.0,
+    poll_interval_s: float = 0.5,
 ) -> Optional[Dict[str, Any]]:
     """
     Faz polling à Binance Futures até a ordem ficar FILLED ou o timeout expirar.
-    Devolve o JSON da ordem FILLED ou None se não encher (CANCELED / EXPIRED / timeout).
     """
     print(f"-> Waiting for fill of order_id={order_id} on {symbol} ...")
     deadline = time.time() + timeout_s
@@ -459,6 +438,59 @@ def place_bracket_orders(
 
 
 # -----------------------------------------------------------------------------
+# MARKET order com retries de precisão
+# -----------------------------------------------------------------------------
+def send_market_order_with_precision_retries(
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    qty_decimals: int,
+) -> Dict[str, Any]:
+    """
+    Envia uma ordem MARKET, tentando reduzir o nº de casas decimais na quantity
+    se a Binance devolver o erro:
+        "Precision is over the maximum defined for this asset."
+    """
+    last_error: Optional[Exception] = None
+
+    for d in range(qty_decimals, -1, -1):
+        qty_str = format_quantity(qty, d)
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty_str,
+        }
+
+        print(f"-> Trying MARKET order with quantity={qty_str} (decimals={d}) ...")
+
+        try:
+            resp = signed_request("POST", "/fapi/v1/order", params)
+            data = resp.json()
+            print("Order response:")
+            print(data)
+            return data
+
+        except requests.exceptions.HTTPError as e:
+            resp = getattr(e, "response", None)
+            text = resp.text if resp is not None else ""
+            if (
+                "Precision is over the maximum defined for this asset" in text
+                and d > 0
+            ):
+                print("   -> Precision error, lowering decimals and retrying...")
+                last_error = e
+                continue
+
+            # Outro erro, ou já estamos em 0 decimais: re-lança
+            raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Failed to send MARKET order due to unknown precision issue.")
+
+
+# -----------------------------------------------------------------------------
 # Supabase
 # -----------------------------------------------------------------------------
 def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
@@ -496,13 +528,6 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
     return signal
 
 
-def update_signal(id_: Any, fields: Dict[str, Any]) -> None:
-    """
-    Helper simples para fazer update na tabela de sinais.
-    """
-    SUPABASE.table(SIGNALS_TABLE).update(fields).eq("id", id_).execute()
-
-
 # -----------------------------------------------------------------------------
 # MAIN (loop infinito a processar sinais)
 # -----------------------------------------------------------------------------
@@ -516,8 +541,6 @@ def main() -> None:
             if not signal:
                 time.sleep(5)
                 continue
-
-            signal_id = signal["id"]
 
             symbol_spot = str(signal["symbol"])
             direction = str(signal["direction"]).upper()
@@ -561,84 +584,47 @@ def main() -> None:
 
             if DRY_RUN:
                 print("DRY_RUN=1 -> Ordem NÃO enviada, apenas simulação.")
-                # Em DRY_RUN marcamos o sinal como tratado
-                update_signal(
-                    signal_id,
+                SUPABASE.table(SIGNALS_TABLE).update(
                     {
+                        "futures_entry_sent": True,
                         "futures_symbol": futures_symbol,
                         "futures_entry_status": "DRY_RUN",
-                        "futures_entry_sent": True,
-                    },
-                )
-                print(f"-> Marked signal {signal_id} as futures_entry_sent=true (DRY_RUN).")
+                    }
+                ).eq("id", signal["id"]).execute()
+                print(f"-> Marked signal {signal['id']} as futures_entry_sent=true (DRY_RUN).")
                 time.sleep(1)
                 continue
 
             print(f"-> Sending MARKET order to {ENV_LABEL}...")
 
-            params: Dict[str, Any] = {
-                "symbol": futures_symbol,
-                "side": direction,
-                "type": "MARKET",
-                "quantity": qty_str,
-            }
-
-            resp = signed_request("POST", "/fapi/v1/order", params)
-            order = resp.json()
-
-            print("Order response:")
-            print(order)
-
-            order_id = order.get("orderId")
-            status = order.get("status")
-
-            # Atualizar imediatamente informação da entrada no Supabase
-            update_signal(
-                signal_id,
-                {
-                    "futures_symbol": futures_symbol,
-                    "futures_entry_order_id": str(order_id) if order_id is not None else None,
-                    "futures_entry_status": status,
-                },
+            order = send_market_order_with_precision_retries(
+                symbol=futures_symbol,
+                side=direction,
+                qty=adj_qty,
+                qty_decimals=qty_decimals,
             )
 
+            order_id = order.get("orderId")
             if not isinstance(order_id, int):
                 try:
                     order_id = int(order_id)
                 except Exception:
                     print("-> Não consegui obter orderId válido; não envio bracket orders.")
-                    # Marcamos como erro após entrada
-                    update_signal(
-                        signal_id,
-                        {"futures_entry_status": "ERROR_INVALID_ORDER_ID"},
-                    )
                     time.sleep(5)
                     continue
 
             filled_data = wait_for_fill(
                 symbol=futures_symbol,
                 order_id=order_id,
-                timeout_s=60.0,
-                poll_interval_s=1.0,
+                timeout_s=10.0,
+                poll_interval_s=0.5,
             )
 
             if not filled_data:
-                # Ordem não chegou a FILLED; não criamos SL/TP, marcamos estado e NÃO repetimos
-                update_signal(
-                    signal_id,
-                    {"futures_entry_status": "NOT_FILLED_TIMEOUT_OR_CANCELED"},
-                )
                 time.sleep(5)
                 continue
 
-            # Atualizar estado da ordem de entrada como FILLED
-            filled_status = filled_data.get("status")
-            update_signal(
-                signal_id,
-                {"futures_entry_status": filled_status},
-            )
-
-            # Enviar bracket orders (SL + TPs)
+            # Enviar bracket orders
             place_bracket_orders(
                 symbol=futures_symbol,
                 side_entry=direction,
@@ -652,19 +638,21 @@ def main() -> None:
                 qty_decimals=qty_decimals,
             )
 
-            # Se tudo correu bem, marcamos o sinal como tratado
-            update_signal(
-                signal_id,
-                {"futures_entry_sent": True},
-            )
-            print(f"-> Marked signal {signal_id} as futures_entry_sent=true.")
+            # Atualizar o sinal no Supabase
+            SUPABASE.table(SIGNALS_TABLE).update(
+                {
+                    "futures_entry_sent": True,
+                    "futures_symbol": futures_symbol,
+                    "futures_entry_order_id": order_id,
+                    "futures_entry_status": filled_data.get("status", "FILLED"),
+                }
+            ).eq("id", signal["id"]).execute()
+            print(f"-> Marked signal {signal['id']} as futures_entry_sent=true.")
 
         except Exception as e:
             print(f"Error processing signal: {e}")
-            # Aqui não mexo em futures_entry_sent para poderes ver o erro e decidir
             time.sleep(5)
 
-        # pequena pausa entre iterações
         time.sleep(1)
 
 
