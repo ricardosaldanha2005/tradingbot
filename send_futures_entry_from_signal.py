@@ -7,7 +7,7 @@ ordens MARKET para a Binance FUTURES (TESTNET ou real),
 calculando a quantidade com base no risco por trade e no stop loss.
 
 Depois de a ordem de entrada ser preenchida, cria automaticamente:
-- 1 STOP_MARKET de Stop Loss
+- 1 STOP_MARKET de Stop Loss (quantity fixa + reduceOnly=True)
 - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
 
 Este script corre em loop:
@@ -390,8 +390,9 @@ def place_bracket_orders(
 ) -> None:
     """
     Cria:
-      - 1 STOP_MARKET de SL (closePosition=True, reduceOnly=True)
-      - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
+      - 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True)
+      - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly com quantity fixa
+    Não usa closePosition em nenhum pedido.
     """
     side_entry = side_entry.upper()
     if side_entry not in ("BUY", "SELL"):
@@ -401,39 +402,52 @@ def place_bracket_orders(
 
     print("-> Placing bracket orders (SL + TPs)...")
 
-    # STOP LOSS
+    # Ajustar a qty total à step_size por segurança
+    total_qty = quantize_to_step(qty, step_size)
+    if total_qty < min_qty:
+        raise ValueError(
+            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TP."
+        )
+
+    sl_qty_str = format_quantity(total_qty, qty_decimals)
+
+    # STOP LOSS (sem closePosition, com quantity + reduceOnly)
     sl_params: Dict[str, Any] = {
         "symbol": symbol,
         "side": side_close,
         "type": "STOP_MARKET",
         "stopPrice": str(stop_loss),
-        "closePosition": True,
-        "workingType": "CONTRACT_PRICE",
+        "quantity": sl_qty_str,
         "reduceOnly": True,
+        "workingType": "CONTRACT_PRICE",
+        "positionSide": "BOTH",
     }
 
-    print("   Sending STOP_MARKET (SL) ...")
+    print(f"   Sending STOP_MARKET (SL) qty={sl_qty_str}, price={stop_loss} ...")
     sl_resp = signed_request("POST", "/fapi/v1/order", sl_params)
     print("   SL response:")
     print(sl_resp.json())
 
     # TP ORDERS
     tp_prices = [tp1, tp2, tp3]
-    qty_parts = split_quantity_for_tps(qty, min_qty, step_size)
+    qty_parts = split_quantity_for_tps(total_qty, min_qty, step_size)
     usable_tps = tp_prices[: len(qty_parts)]
 
     for i, (part_qty, tp_price) in enumerate(zip(qty_parts, usable_tps), start=1):
-        qty_str = format_quantity(part_qty, qty_decimals)
+        part_qty_str = format_quantity(part_qty, qty_decimals)
         tp_params: Dict[str, Any] = {
             "symbol": symbol,
             "side": side_close,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": str(tp_price),
-            "quantity": qty_str,
+            "quantity": part_qty_str,
             "reduceOnly": True,
             "workingType": "CONTRACT_PRICE",
+            "positionSide": "BOTH",
         }
-        print(f"   Sending TAKE_PROFIT_MARKET TP{i} (qty={qty_str}, price={tp_price}) ...")
+        print(
+            f"   Sending TAKE_PROFIT_MARKET TP{i} (qty={part_qty_str}, price={tp_price}) ..."
+        )
         tp_resp = signed_request("POST", "/fapi/v1/order", tp_params)
         print(f"   TP{i} response:")
         print(tp_resp.json())
@@ -650,11 +664,29 @@ def main() -> None:
                 time.sleep(5)
                 continue
 
-            # Enviar bracket orders
+            # Quantidade realmente executada
+            try:
+                executed_qty = Decimal(str(filled_data.get("executedQty", "0")))
+            except Exception:
+                executed_qty = Decimal("0")
+
+            if executed_qty <= 0:
+                print("-> executedQty <= 0, vou usar adj_qty como fallback.")
+                effective_qty = adj_qty
+            else:
+                effective_qty = quantize_to_step(executed_qty, step_size)
+                if effective_qty <= 0:
+                    raise ValueError(
+                        f"executedQty {executed_qty} ajustada à step_size ficou <= 0."
+                    )
+
+            print(f"-> Effective filled qty for bracket orders: {effective_qty}")
+
+            # Enviar bracket orders com a qty efetivamente executada
             place_bracket_orders(
                 symbol=futures_symbol,
                 side_entry=direction,
-                qty=adj_qty,
+                qty=effective_qty,
                 stop_loss=stop_loss,
                 tp1=tp1,
                 tp2=tp2,
