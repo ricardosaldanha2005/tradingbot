@@ -117,7 +117,12 @@ def signed_request(method: str, path: str, params: Dict[str, Any]) -> requests.R
 
 def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     """
-    Vai buscar os filtros do símbolo (LOT_SIZE) e devolve:
+    Vai buscar:
+      - LOT_SIZE.minQty
+      - LOT_SIZE.stepSize
+      - quantityPrecision  -> nº máximo de casas decimais permitido na QUANTITY
+
+    Devolve:
       (min_qty, step_size, qty_decimals)
     """
     path = "/fapi/v1/exchangeInfo"
@@ -136,6 +141,7 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
         raise RuntimeError(f"Symbol {symbol} not found in Binance exchangeInfo")
 
     info = symbols[0]
+
     lot_filter = None
     for f in info.get("filters", []):
         if f.get("filterType") == "LOT_SIZE":
@@ -151,17 +157,27 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     min_qty = Decimal(min_qty_str)
     step_size = Decimal(step_size_str)
 
-    # Inferir nº de casas decimais a partir do step_size
+    # Decimais deduzidos do step_size (fallback)
     step_str = step_size_str.rstrip("0")
     if "." in step_str:
-        decimals = len(step_str.split(".")[1])
+        decimals_from_step = len(step_str.split(".")[1])
     else:
-        decimals = 0
+        decimals_from_step = 0
 
-    print(f"  min_qty   : {min_qty_str}")
-    print(f"  step_size : {step_size_str}")
+    # Se existir quantityPrecision, usamos isso como limite "oficial"
+    qp = info.get("quantityPrecision")
+    if qp is not None:
+        qty_decimals = int(qp)
+    else:
+        qty_decimals = decimals_from_step
 
-    return min_qty, step_size, decimals
+    print(f"  min_qty           : {min_qty_str}")
+    print(f"  step_size         : {step_size_str}")
+    print(f"  quantityPrecision : {info.get('quantityPrecision')}")
+    print(f"  qty_decimals used : {qty_decimals}")
+
+    return min_qty, step_size, qty_decimals
+
 
 
 def get_futures_balance(asset: str = "USDT") -> Decimal:
