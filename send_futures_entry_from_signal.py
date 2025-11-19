@@ -2,18 +2,24 @@
 """
 send_futures_entry_from_signal.py
 
-Lê o último sinal aberto na tabela 'signals' do Supabase e envia
-uma ordem MARKET para a Binance FUTURES (TESTNET ou real),
+Lê sinais 'open' da tabela 'signals' (Supabase) e envia
+ordens MARKET para a Binance Futures (TESTNET ou real),
 calculando a quantidade com base no risco por trade e no stop loss.
 
 Depois de a ordem de entrada ser preenchida, cria automaticamente:
 - 1 STOP_MARKET de Stop Loss
 - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
 
-Este script agora corre em loop:
+Corre em loop:
 - procura sinais com status='open' e futures_entry_sent=false
 - processa 1 sinal de cada vez
-- no fim marca futures_entry_sent=true para não voltar a repetir o mesmo sinal
+- depois marca futures_entry_sent=true (se a entrada + SL/TP forem bem sucedidos)
+
+Campos usados na tabela 'signals':
+- futures_entry_sent      (boolean)
+- futures_symbol          (text)
+- futures_entry_order_id  (text ou bigint)
+- futures_entry_status    (text)
 
 ENV necessários:
 
@@ -30,7 +36,7 @@ ENV necessários:
 
   # Opcional:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
-  DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
+  DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca como tratado)
 """
 
 import os
@@ -292,74 +298,17 @@ def calculate_position_size(
 
 
 # -----------------------------------------------------------------------------
-# Helper: enviar MARKET com retry de precisão (-1111)
-# -----------------------------------------------------------------------------
-def send_market_order_with_precision_retry(
-    symbol: str,
-    side: str,
-    base_qty: Decimal,
-    max_decimals: int,
-) -> Tuple[Dict[str, Any], str]:
-    """
-    Tenta enviar uma ordem MARKET reduzindo o nº de casas decimais
-    se a Binance devolver o erro -1111 (Precision is over the maximum defined...).
-
-    Devolve:
-      (order_json, qty_str_usada)
-    """
-    side = side.upper()
-
-    for dec in range(max_decimals, -1, -1):
-        qty_str = format_quantity(base_qty, dec)
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": qty_str,
-        }
-
-        print(f"   Trying MARKET with qty={qty_str} (decimals={dec}) ...")
-
-        try:
-            resp = signed_request("POST", "/fapi/v1/order", params)
-            order = resp.json()
-            print(f"   MARKET accepted with qty={qty_str} (decimals={dec})")
-            return order, qty_str
-
-        except requests.exceptions.HTTPError as e:
-            err_text = ""
-            try:
-                err_text = e.response.text
-            except Exception:
-                pass
-
-            # Se for erro de precisão, tentamos com menos casas
-            if "-1111" in err_text:
-                print(
-                    f"   Binance -1111 precision error with qty={qty_str}, "
-                    f"trying fewer decimals..."
-                )
-                continue
-
-            # Qualquer outro erro, re-levanta
-            raise
-
-    raise RuntimeError(
-        "Could not send MARKET order: all decimal precisions failed with -1111."
-    )
-
-
-# -----------------------------------------------------------------------------
 # Helpers de ordens: esperar fill + bracket orders (SL + TPs)
 # -----------------------------------------------------------------------------
 def wait_for_fill(
     symbol: str,
     order_id: int,
-    timeout_s: float = 10.0,
-    poll_interval_s: float = 0.5,
+    timeout_s: float = 60.0,
+    poll_interval_s: float = 1.0,
 ) -> Optional[Dict[str, Any]]:
     """
     Faz polling à Binance Futures até a ordem ficar FILLED ou o timeout expirar.
+    Devolve o JSON da ordem FILLED ou None se não encher (CANCELED / EXPIRED / timeout).
     """
     print(f"-> Waiting for fill of order_id={order_id} on {symbol} ...")
     deadline = time.time() + timeout_s
@@ -532,6 +481,13 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
     return signal
 
 
+def update_signal(id_: Any, fields: Dict[str, Any]) -> None:
+    """
+    Helper simples para fazer update na tabela de sinais.
+    """
+    SUPABASE.table(SIGNALS_TABLE).update(fields).eq("id", id_).execute()
+
+
 # -----------------------------------------------------------------------------
 # MAIN (loop infinito a processar sinais)
 # -----------------------------------------------------------------------------
@@ -543,9 +499,10 @@ def main() -> None:
         try:
             signal = fetch_latest_open_signal()
             if not signal:
-                # nada para fazer, espera um pouco
                 time.sleep(5)
                 continue
+
+            signal_id = signal["id"]
 
             symbol_spot = str(signal["symbol"])
             direction = str(signal["direction"]).upper()
@@ -580,63 +537,93 @@ def main() -> None:
                 if BINANCE_TESTNET
                 else "=== FUTURES ORDER TO SEND (LIVE) ==="
             )
-            print(f"Symbol          : {futures_symbol}")
-            print(f"Side            : {direction}")
-            print(f"Entry           : {entry}")
-            print(f"Stop Loss       : {stop_loss}")
-            print(f"Quantity (calc) : {qty_str}")
+            print(f"Symbol    : {futures_symbol}")
+            print(f"Side      : {direction}")
+            print(f"Entry     : {entry}")
+            print(f"Stop Loss : {stop_loss}")
+            print(f"Quantity  : {qty_str}")
             print("=======================================")
 
             if DRY_RUN:
                 print("DRY_RUN=1 -> Ordem NÃO enviada, apenas simulação.")
-                # Mesmo em DRY_RUN marcamos o sinal como tratado
-                SUPABASE.table(SIGNALS_TABLE).update(
-                    {"futures_entry_sent": True}
-                ).eq("id", signal["id"]).execute()
-                print(f"-> Marked signal {signal['id']} as futures_entry_sent=true (DRY_RUN).")
+                # Em DRY_RUN marcamos o sinal como tratado
+                update_signal(
+                    signal_id,
+                    {
+                        "futures_symbol": futures_symbol,
+                        "futures_entry_status": "DRY_RUN",
+                        "futures_entry_sent": True,
+                    },
+                )
+                print(f"-> Marked signal {signal_id} as futures_entry_sent=true (DRY_RUN).")
                 time.sleep(1)
                 continue
 
             print(f"-> Sending MARKET order to {ENV_LABEL}...")
 
-            # Tenta com qty_decimals, e se der -1111 vai descendo as casas decimais
-            order, final_qty_str = send_market_order_with_precision_retry(
-                symbol=futures_symbol,
-                side=direction,
-                base_qty=adj_qty,
-                max_decimals=qty_decimals,
-            )
+            params: Dict[str, Any] = {
+                "symbol": futures_symbol,
+                "side": direction,
+                "type": "MARKET",
+                "quantity": qty_str,
+            }
+
+            resp = signed_request("POST", "/fapi/v1/order", params)
+            order = resp.json()
 
             print("Order response:")
             print(order)
 
-            # Atualizar quantidade realmente usada para os TPs/SL
-            adj_qty = Decimal(final_qty_str)
-            qty_str = final_qty_str
-
             order_id = order.get("orderId")
+            status = order.get("status")
+
+            # Atualizar imediatamente informação da entrada no Supabase
+            update_signal(
+                signal_id,
+                {
+                    "futures_symbol": futures_symbol,
+                    "futures_entry_order_id": str(order_id) if order_id is not None else None,
+                    "futures_entry_status": status,
+                },
+            )
+
             if not isinstance(order_id, int):
                 try:
                     order_id = int(order_id)
                 except Exception:
                     print("-> Não consegui obter orderId válido; não envio bracket orders.")
-                    # Não marcamos como tratado, para poderes investigar
+                    # Marcamos como erro após entrada
+                    update_signal(
+                        signal_id,
+                        {"futures_entry_status": "ERROR_INVALID_ORDER_ID"},
+                    )
                     time.sleep(5)
                     continue
 
             filled_data = wait_for_fill(
                 symbol=futures_symbol,
                 order_id=order_id,
-                timeout_s=10.0,
-                poll_interval_s=0.5,
+                timeout_s=60.0,
+                poll_interval_s=1.0,
             )
 
             if not filled_data:
-                # Não marcamos como tratado; posição pode não existir
+                # Ordem não chegou a FILLED; não criamos SL/TP, marcamos estado e NÃO repetimos
+                update_signal(
+                    signal_id,
+                    {"futures_entry_status": "NOT_FILLED_TIMEOUT_OR_CANCELED"},
+                )
                 time.sleep(5)
                 continue
 
-            # Enviar bracket orders
+            # Atualizar estado da ordem de entrada como FILLED
+            filled_status = filled_data.get("status")
+            update_signal(
+                signal_id,
+                {"futures_entry_status": filled_status},
+            )
+
+            # Enviar bracket orders (SL + TPs)
             place_bracket_orders(
                 symbol=futures_symbol,
                 side_entry=direction,
@@ -651,14 +638,15 @@ def main() -> None:
             )
 
             # Se tudo correu bem, marcamos o sinal como tratado
-            SUPABASE.table(SIGNALS_TABLE).update(
-                {"futures_entry_sent": True}
-            ).eq("id", signal["id"]).execute()
-            print(f"-> Marked signal {signal['id']} as futures_entry_sent=true.")
+            update_signal(
+                signal_id,
+                {"futures_entry_sent": True},
+            )
+            print(f"-> Marked signal {signal_id} as futures_entry_sent=true.")
 
         except Exception as e:
             print(f"Error processing signal: {e}")
-            # pequena pausa para não entrar em loop maluco de erros
+            # Aqui não mexo em futures_entry_sent para poderes ver o erro e decidir
             time.sleep(5)
 
         # pequena pausa entre iterações
