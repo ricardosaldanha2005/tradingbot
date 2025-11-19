@@ -126,7 +126,14 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     Vai buscar:
       - LOT_SIZE.minQty
       - LOT_SIZE.stepSize
-      - quantityPrecision  -> nº máximo de casas decimais permitido na QUANTITY
+      - quantityPrecision
+      - baseAssetPrecision
+
+    E calcula o nº máximo de casas decimais permitidas na QUANTITY como:
+
+        qty_decimals = min(decimais_do_step,
+                           quantityPrecision (se existir),
+                           baseAssetPrecision (se existir))
 
     Devolve:
       (min_qty, step_size, qty_decimals)
@@ -170,17 +177,25 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     else:
         decimals_from_step = 0
 
-    # Se existir quantityPrecision, usamos isso como limite "oficial"
-    qp = info.get("quantityPrecision")
-    if qp is not None:
-        qty_decimals = int(qp)
-    else:
-        qty_decimals = decimals_from_step
+    quantity_precision = info.get("quantityPrecision")
+    base_asset_precision = info.get("baseAssetPrecision")
 
-    print(f"  min_qty           : {min_qty_str}")
-    print(f"  step_size         : {step_size_str}")
-    print(f"  quantityPrecision : {info.get('quantityPrecision')}")
-    print(f"  qty_decimals used : {qty_decimals}")
+    # Construir lista de candidatos e tirar o mínimo
+    candidates: List[int] = [decimals_from_step]
+
+    if quantity_precision is not None:
+        candidates.append(int(quantity_precision))
+
+    if base_asset_precision is not None:
+        candidates.append(int(base_asset_precision))
+
+    qty_decimals = min(candidates)
+
+    print(f"  min_qty            : {min_qty_str}")
+    print(f"  step_size          : {step_size_str}")
+    print(f"  quantityPrecision  : {quantity_precision}")
+    print(f"  baseAssetPrecision : {base_asset_precision}")
+    print(f"  qty_decimals used  : {qty_decimals}")
 
     return min_qty, step_size, qty_decimals
 
