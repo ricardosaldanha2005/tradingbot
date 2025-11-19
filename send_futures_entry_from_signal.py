@@ -31,6 +31,7 @@ ENV necessários:
   # Opcional:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
   DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
+  MAX_FUTURES_NOTIONAL_USDT=1500    # notional máximo por trade (USDT). Opcional.
 """
 
 import os
@@ -69,6 +70,7 @@ else:
 RISK_PER_TRADE_PCT = Decimal(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 FUTURES_BALANCE_ASSET = os.getenv("FUTURES_BALANCE_ASSET", "USDT")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+MAX_FUTURES_NOTIONAL_USDT = os.getenv("MAX_FUTURES_NOTIONAL_USDT")
 
 # Timeout de requests para a Binance
 REQUEST_TIMEOUT = 10
@@ -569,6 +571,30 @@ def main() -> None:
                 step_size=step_size,
                 qty_decimals=qty_decimals,
             )
+
+            # Opcional: limitar o notional máximo por trade
+            if MAX_FUTURES_NOTIONAL_USDT:
+                try:
+                    max_notional = Decimal(MAX_FUTURES_NOTIONAL_USDT)
+                except Exception:
+                    max_notional = None
+
+                if max_notional and max_notional > 0:
+                    current_notional = entry * adj_qty
+                    print(f"-> Current notional: {current_notional} {FUTURES_BALANCE_ASSET}")
+                    print(f"-> Max notional allowed by config: {max_notional} {FUTURES_BALANCE_ASSET}")
+
+                    if current_notional > max_notional:
+                        print("-> Notional acima do limite configurado, vou reduzir a quantidade...")
+                        # nova qty = max_notional / entry, ajustada ao step_size
+                        new_qty = quantize_to_step(max_notional / entry, step_size)
+                        if new_qty <= 0:
+                            raise ValueError(
+                                f"Clamped quantity <= 0 depois de aplicar MAX_FUTURES_NOTIONAL_USDT={max_notional}"
+                            )
+                        adj_qty = new_qty
+                        qty_str = format_quantity(adj_qty, qty_decimals)
+                        print(f"  qty (clamped) : {qty_str}")
 
             print(
                 "=== FUTURES ORDER TO SEND (TESTNET) ==="
