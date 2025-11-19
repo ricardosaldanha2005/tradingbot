@@ -8,7 +8,6 @@ calculando a quantidade com base no risco por trade e no stop loss.
 
 Depois de a ordem de entrada ser preenchida, cria automaticamente:
 - 1 STOP_MARKET de Stop Loss (quantity fixa + reduceOnly=True)
-- até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly
 
 Este script corre em loop:
 - procura sinais com status='open' e futures_entry_sent=false
@@ -39,7 +38,7 @@ import time
 import hmac
 import hashlib
 from decimal import Decimal
-from typing import Any, Dict, Tuple, Optional, List
+from typing import Any, Dict, Tuple, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -295,7 +294,7 @@ def calculate_position_size(
 
 
 # -----------------------------------------------------------------------------
-# Helpers de ordens: esperar fill + bracket orders (SL + TPs)
+# Helpers de ordens: esperar fill
 # -----------------------------------------------------------------------------
 def wait_for_fill(
     symbol: str,
@@ -328,56 +327,17 @@ def wait_for_fill(
             return data
 
         if status in ("CANCELED", "REJECTED", "EXPIRED", "PENDING_CANCEL"):
-            print(f"-> Entry order ended with status={status}, aborting bracket.")
+            print(f"-> Entry order ended with status={status}, aborting SL.")
             return None
 
         time.sleep(poll_interval_s)
 
-    print("-> Timeout waiting for fill; bracket orders NOT sent.")
+    print("-> Timeout waiting for fill; SL order NOT sent.")
     return None
 
 
-def split_quantity_for_tps(
-    total_qty: Decimal,
-    min_qty: Decimal,
-    step_size: Decimal,
-) -> List[Decimal]:
-    """
-    Divide a quantidade total em até 3 partes (tp1, tp2, tp3).
-    Garante que cada parte é >= min_qty; se não der, reduz nº de TPs.
-    """
-
-    def mk_part(fraction: Decimal) -> Decimal:
-        return quantize_to_step(total_qty * fraction, step_size)
-
-    # Tentativa 3 partes
-    q1 = mk_part(Decimal("0.33"))
-    q2 = mk_part(Decimal("0.33"))
-    q3 = quantize_to_step(total_qty - q1 - q2, step_size)
-    parts3 = [q for q in (q1, q2, q3) if q >= min_qty]
-
-    if len(parts3) == 3 and sum(parts3) > 0:
-        return parts3
-
-    # Tentativa 2 partes
-    q1 = mk_part(Decimal("0.5"))
-    q2 = quantize_to_step(total_qty - q1, step_size)
-    parts2 = [q for q in (q1, q2) if q >= min_qty]
-
-    if len(parts2) == 2 and sum(parts2) > 0:
-        return parts2
-
-    # Fallback: 1 parte (tudo)
-    total_adj = quantize_to_step(total_qty, step_size)
-    if total_adj < min_qty:
-        raise ValueError(
-            f"Total quantity {total_qty} below min_qty {min_qty}, cannot place TP."
-        )
-    return [total_adj]
-
-
 # -----------------------------------------------------------------------------
-# Função genérica de ordem com retries de precisão (para MARKET, SL e TPs)
+# Função genérica de ordem com retries de precisão
 # -----------------------------------------------------------------------------
 def send_order_with_precision_retries(
     symbol: str,
@@ -452,26 +412,19 @@ def send_market_order_with_precision_retries(
 
 
 # -----------------------------------------------------------------------------
-# Bracket orders (SL + TPs) usando retries de precisão
+# SL apenas (sem TPs)
 # -----------------------------------------------------------------------------
-def place_bracket_orders(
+def place_sl_order(
     symbol: str,
     side_entry: str,
     qty: Decimal,
     stop_loss: Decimal,
-    tp1: Decimal,
-    tp2: Decimal,
-    tp3: Decimal,
     step_size: Decimal,
     min_qty: Decimal,
     qty_decimals: int,
 ) -> None:
     """
-    Cria:
-      - 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True)
-      - até 3 TAKE_PROFIT_MARKET (tp1, tp2, tp3) em modo reduceOnly com quantity fixa
-
-    Usa send_order_with_precision_retries para lidar com a precisão de quantity.
+    Cria apenas 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True).
     """
     side_entry = side_entry.upper()
     if side_entry not in ("BUY", "SELL"):
@@ -479,16 +432,15 @@ def place_bracket_orders(
 
     side_close = "SELL" if side_entry == "BUY" else "BUY"
 
-    print("-> Placing bracket orders (SL + TPs)...")
+    print("-> Placing SL order (no TPs)...")
 
     # Ajustar a qty total à step_size por segurança
     total_qty = quantize_to_step(qty, step_size)
     if total_qty < min_qty:
         raise ValueError(
-            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TP."
+            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL."
         )
 
-    # STOP LOSS
     sl_base_params: Dict[str, Any] = {
         "type": "STOP_MARKET",
         "stopPrice": str(stop_loss),
@@ -497,7 +449,10 @@ def place_bracket_orders(
         "positionSide": "BOTH",
     }
 
-    print(f"   Sending STOP_MARKET (SL) qty≈{format_quantity(total_qty, qty_decimals)}, price={stop_loss} ...")
+    print(
+        f"   Sending STOP_MARKET (SL) qty≈{format_quantity(total_qty, qty_decimals)}, "
+        f"price={stop_loss} ..."
+    )
     sl_resp = send_order_with_precision_retries(
         symbol=symbol,
         side=side_close,
@@ -507,32 +462,6 @@ def place_bracket_orders(
     )
     print("   SL response:")
     print(sl_resp)
-
-    # TP ORDERS
-    tp_prices = [tp1, tp2, tp3]
-    qty_parts = split_quantity_for_tps(total_qty, min_qty, step_size)
-    usable_tps = tp_prices[: len(qty_parts)]
-
-    for i, (part_qty, tp_price) in enumerate(zip(qty_parts, usable_tps), start=1):
-        tp_base_params: Dict[str, Any] = {
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": str(tp_price),
-            "reduceOnly": True,
-            "workingType": "CONTRACT_PRICE",
-            "positionSide": "BOTH",
-        }
-        print(
-            f"   Sending TAKE_PROFIT_MARKET TP{i} (qty≈{format_quantity(part_qty, qty_decimals)}, price={tp_price}) ..."
-        )
-        tp_resp = send_order_with_precision_retries(
-            symbol=symbol,
-            side=side_close,
-            base_params=tp_base_params,
-            qty=part_qty,
-            qty_decimals=qty_decimals,
-        )
-        print(f"   TP{i} response:")
-        print(tp_resp)
 
 
 # -----------------------------------------------------------------------------
@@ -567,7 +496,6 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
     print(f"  direction : {signal.get('direction')}")
     print(f"  status    : {signal.get('status')}")
     print(f"  entry     : {signal.get('entry')}")
-    print(f"  tp1       : {signal.get('tp1')}")
     print(f"  stop_loss : {signal.get('stop_loss')}")
 
     return signal
@@ -591,10 +519,6 @@ def main() -> None:
             direction = str(signal["direction"]).upper()
             entry = Decimal(str(signal["entry"]))
             stop_loss = Decimal(str(signal["stop_loss"]))
-
-            tp1 = Decimal(str(signal["tp1"]))
-            tp2 = Decimal(str(signal["tp2"]))
-            tp3 = Decimal(str(signal["tp3"]))
 
             futures_symbol = normalize_futures_symbol(symbol_spot)
             print(f"-> Normalized futures symbol: {futures_symbol}")
@@ -678,7 +602,7 @@ def main() -> None:
                 try:
                     order_id = int(order_id)
                 except Exception:
-                    print("-> Não consegui obter orderId válido; não envio bracket orders.")
+                    print("-> Não consegui obter orderId válido; não envio SL.")
                     time.sleep(5)
                     continue
 
@@ -709,17 +633,14 @@ def main() -> None:
                         f"executedQty {executed_qty} ajustada à step_size ficou <= 0."
                     )
 
-            print(f"-> Effective filled qty for bracket orders: {effective_qty}")
+            print(f"-> Effective filled qty for SL: {effective_qty}")
 
-            # Enviar bracket orders com a qty efetivamente executada
-            place_bracket_orders(
+            # Enviar ordem de SL com a qty efetivamente executada
+            place_sl_order(
                 symbol=futures_symbol,
                 side_entry=direction,
                 qty=effective_qty,
                 stop_loss=stop_loss,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
                 step_size=step_size,
                 min_qty=min_qty,
                 qty_decimals=qty_decimals,
