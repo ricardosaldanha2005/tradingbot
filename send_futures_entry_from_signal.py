@@ -37,7 +37,7 @@ import os
 import time
 import hmac
 import hashlib
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from typing import Any, Dict, Tuple, Optional, List
 
 import requests
@@ -179,7 +179,6 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     return min_qty, step_size, qty_decimals
 
 
-
 def get_futures_balance(asset: str = "USDT") -> Decimal:
     """
     Vai buscar o balance (wallet balance) no futures para o asset dado.
@@ -290,6 +289,64 @@ def calculate_position_size(
     print(f"  qty     : {qty_str}")
 
     return raw_qty, adj_qty, qty_str
+
+
+# -----------------------------------------------------------------------------
+# Helper: enviar MARKET com retry de precisão (-1111)
+# -----------------------------------------------------------------------------
+def send_market_order_with_precision_retry(
+    symbol: str,
+    side: str,
+    base_qty: Decimal,
+    max_decimals: int,
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Tenta enviar uma ordem MARKET reduzindo o nº de casas decimais
+    se a Binance devolver o erro -1111 (Precision is over the maximum defined...).
+
+    Devolve:
+      (order_json, qty_str_usada)
+    """
+    side = side.upper()
+
+    for dec in range(max_decimals, -1, -1):
+        qty_str = format_quantity(base_qty, dec)
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty_str,
+        }
+
+        print(f"   Trying MARKET with qty={qty_str} (decimals={dec}) ...")
+
+        try:
+            resp = signed_request("POST", "/fapi/v1/order", params)
+            order = resp.json()
+            print(f"   MARKET accepted with qty={qty_str} (decimals={dec})")
+            return order, qty_str
+
+        except requests.exceptions.HTTPError as e:
+            err_text = ""
+            try:
+                err_text = e.response.text
+            except Exception:
+                pass
+
+            # Se for erro de precisão, tentamos com menos casas
+            if "-1111" in err_text:
+                print(
+                    f"   Binance -1111 precision error with qty={qty_str}, "
+                    f"trying fewer decimals..."
+                )
+                continue
+
+            # Qualquer outro erro, re-levanta
+            raise
+
+    raise RuntimeError(
+        "Could not send MARKET order: all decimal precisions failed with -1111."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -523,11 +580,11 @@ def main() -> None:
                 if BINANCE_TESTNET
                 else "=== FUTURES ORDER TO SEND (LIVE) ==="
             )
-            print(f"Symbol    : {futures_symbol}")
-            print(f"Side      : {direction}")
-            print(f"Entry     : {entry}")
-            print(f"Stop Loss : {stop_loss}")
-            print(f"Quantity  : {qty_str}")
+            print(f"Symbol          : {futures_symbol}")
+            print(f"Side            : {direction}")
+            print(f"Entry           : {entry}")
+            print(f"Stop Loss       : {stop_loss}")
+            print(f"Quantity (calc) : {qty_str}")
             print("=======================================")
 
             if DRY_RUN:
@@ -542,18 +599,20 @@ def main() -> None:
 
             print(f"-> Sending MARKET order to {ENV_LABEL}...")
 
-            params: Dict[str, Any] = {
-                "symbol": futures_symbol,
-                "side": direction,
-                "type": "MARKET",
-                "quantity": qty_str,
-            }
-
-            resp = signed_request("POST", "/fapi/v1/order", params)
-            order = resp.json()
+            # Tenta com qty_decimals, e se der -1111 vai descendo as casas decimais
+            order, final_qty_str = send_market_order_with_precision_retry(
+                symbol=futures_symbol,
+                side=direction,
+                base_qty=adj_qty,
+                max_decimals=qty_decimals,
+            )
 
             print("Order response:")
             print(order)
+
+            # Atualizar quantidade realmente usada para os TPs/SL
+            adj_qty = Decimal(final_qty_str)
+            qty_str = final_qty_str
 
             order_id = order.get("orderId")
             if not isinstance(order_id, int):
