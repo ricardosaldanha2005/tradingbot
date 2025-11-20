@@ -44,6 +44,7 @@ import hmac
 import hashlib
 from decimal import Decimal
 from typing import Any, Dict, Tuple, Optional
+import datetime as dt
 
 import requests
 from dotenv import load_dotenv
@@ -502,7 +503,7 @@ def place_sl_and_tp_orders(
 
     # Ajustar qty total à step_size
     total_qty = quantize_to_step(qty, step_size)
-    if total_qty < min_qty:
+    if totalQty_lt_min := (total_qty < min_qty):
         raise ValueError(
             f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TPs."
         )
@@ -761,6 +762,7 @@ def main() -> None:
                         "futures_entry_sent": True,
                         "futures_symbol": futures_symbol,
                         "futures_entry_status": "DRY_RUN",
+                        "entered_at": dt.datetime.utcnow().isoformat() + "Z",
                     }
                 ).eq("id", signal["id"]).execute()
                 print(f"-> Marked signal {signal['id']} as futures_entry_sent=true (DRY_RUN).")
@@ -837,16 +839,19 @@ def main() -> None:
                 "futures_symbol": futures_symbol,
                 "futures_entry_order_id": order_id,
                 "futures_entry_status": filled_data.get("status", "FILLED"),
+                # marcar momento da entrada para disparar o webhook de "trade-entered"
+                "entered_at": dt.datetime.utcnow().isoformat() + "Z",
             }
 
+            # usar as colunas que EXISTEM na tua tabela (binance_*):
             if sl_order_id is not None:
-                update_payload["futures_sl_order_id"] = sl_order_id
+                update_payload["binance_sl_order_id"] = sl_order_id
             if tp1_order_id is not None:
-                update_payload["futures_tp1_order_id"] = tp1_order_id
+                update_payload["binance_tp1_order_id"] = tp1_order_id
             if tp2_order_id is not None:
-                update_payload["futures_tp2_order_id"] = tp2_order_id
+                update_payload["binance_tp2_order_id"] = tp2_order_id
             if tp3_order_id is not None:
-                update_payload["futures_tp3_order_id"] = tp3_order_id
+                update_payload["binance_tp3_order_id"] = tp3_order_id
 
             SUPABASE.table(SIGNALS_TABLE).update(update_payload)\
                 .eq("id", signal["id"]).execute()
