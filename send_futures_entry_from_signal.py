@@ -8,6 +8,7 @@ calculando a quantidade com base no risco por trade e no stop loss.
 
 Depois de a ordem de entrada ser preenchida, cria automaticamente:
 - 1 STOP_MARKET de Stop Loss (quantity fixa + reduceOnly=True)
+- 1 TAKE_PROFIT_MARKET (TP1) opcional, se o sinal tiver tp1
 
 Este script corre em loop:
 - procura sinais com status='open' e futures_entry_sent=false
@@ -31,6 +32,7 @@ ENV necessários:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
   DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
   MAX_FUTURES_NOTIONAL_USDT=1500    # notional máximo por trade (USDT). Opcional.
+  TP1_FRACTION=1.0                  # fração da quantidade total para o TP1 (0.5 = metade, 1.0 = tudo)
 """
 
 import os
@@ -70,6 +72,7 @@ RISK_PER_TRADE_PCT = Decimal(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 FUTURES_BALANCE_ASSET = os.getenv("FUTURES_BALANCE_ASSET", "USDT")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 MAX_FUTURES_NOTIONAL_USDT = os.getenv("MAX_FUTURES_NOTIONAL_USDT")
+TP1_FRACTION = Decimal(os.getenv("TP1_FRACTION", "1.0"))
 
 # Timeout de requests para a Binance
 REQUEST_TIMEOUT = 10
@@ -203,6 +206,49 @@ def get_futures_balance(asset: str = "USDT") -> Decimal:
     return Decimal("0")
 
 
+def ensure_isolated_1x(symbol: str) -> None:
+    """
+    Garante que o símbolo está em margem ISOLATED e leverage 1x.
+    Corre antes de abrir a posição.
+    """
+    print(f"-> Ensuring {symbol} is on ISOLATED 1x ...")
+
+    # 1) Mudar marginType para ISOLATED
+    mt_params: Dict[str, Any] = {
+        "symbol": symbol,
+        "marginType": "ISOLATED",
+    }
+    try:
+        resp = signed_request("POST", "/fapi/v1/marginType", mt_params)
+        print("   marginType set to ISOLATED:")
+        print("   ", resp.json())
+    except requests.exceptions.HTTPError as e:
+        r = getattr(e, "response", None)
+        txt = r.text if r is not None else ""
+        if "No need to change margin type" in txt or "-4046" in txt:
+            print("   marginType already ISOLATED, OK.")
+        else:
+            print("   Error setting marginType to ISOLATED:")
+            print("   ", txt)
+            raise
+
+    # 2) Mudar leverage para 1x
+    lev_params: Dict[str, Any] = {
+        "symbol": symbol,
+        "leverage": 1,
+    }
+    try:
+        resp = signed_request("POST", "/fapi/v1/leverage", lev_params)
+        print("   leverage set to 1x:")
+        print("   ", resp.json())
+    except requests.exceptions.HTTPError as e:
+        r = getattr(e, "response", None)
+        txt = r.text if r is not None else ""
+        print("   Error setting leverage to 1x:")
+        print("   ", txt)
+        raise
+
+
 # -----------------------------------------------------------------------------
 # Helpers de quantidade / símbolo
 # -----------------------------------------------------------------------------
@@ -327,12 +373,12 @@ def wait_for_fill(
             return data
 
         if status in ("CANCELED", "REJECTED", "EXPIRED", "PENDING_CANCEL"):
-            print(f"-> Entry order ended with status={status}, aborting SL.")
+            print(f"-> Entry order ended with status={status}, aborting SL/TP1.")
             return None
 
         time.sleep(poll_interval_s)
 
-    print("-> Timeout waiting for fill; SL order NOT sent.")
+    print("-> Timeout waiting for fill; SL/TP1 orders NOT sent.")
     return None
 
 
@@ -392,13 +438,15 @@ def send_order_with_precision_retries(
     raise RuntimeError("Failed to send order due to unknown precision issue.")
 
 
-# Wrapper específico para MARKET
 def send_market_order_with_precision_retries(
     symbol: str,
     side: str,
     qty: Decimal,
     qty_decimals: int,
 ) -> Dict[str, Any]:
+    """
+    Wrapper específico para MARKET.
+    """
     base_params: Dict[str, Any] = {
         "type": "MARKET",
     }
@@ -412,19 +460,25 @@ def send_market_order_with_precision_retries(
 
 
 # -----------------------------------------------------------------------------
-# SL apenas (sem TPs)
+# SL + TP1
 # -----------------------------------------------------------------------------
-def place_sl_order(
+def place_sl_and_tp1_orders(
     symbol: str,
     side_entry: str,
     qty: Decimal,
     stop_loss: Decimal,
+    tp1: Optional[Decimal],
+    tp1_fraction: Decimal,
     step_size: Decimal,
     min_qty: Decimal,
     qty_decimals: int,
 ) -> None:
     """
-    Cria apenas 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True).
+    Cria:
+      - 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True)
+      - 1 TAKE_PROFIT_MARKET (TP1) opcional, com quantity proporcional (tp1_fraction)
+
+    Ambos em reduceOnly, positionSide=BOTH.
     """
     side_entry = side_entry.upper()
     if side_entry not in ("BUY", "SELL"):
@@ -432,15 +486,16 @@ def place_sl_order(
 
     side_close = "SELL" if side_entry == "BUY" else "BUY"
 
-    print("-> Placing SL order (no TPs)...")
+    print("-> Placing SL + TP1 orders...")
 
     # Ajustar a qty total à step_size por segurança
     total_qty = quantize_to_step(qty, step_size)
     if total_qty < min_qty:
         raise ValueError(
-            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL."
+            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TP1."
         )
 
+    # STOP LOSS (sempre full size)
     sl_base_params: Dict[str, Any] = {
         "type": "STOP_MARKET",
         "stopPrice": str(stop_loss),
@@ -462,6 +517,55 @@ def place_sl_order(
     )
     print("   SL response:")
     print(sl_resp)
+
+    # TP1 opcional
+    if tp1 is None:
+        print("   No tp1 in signal; skipping TP1 order.")
+        return
+
+    if tp1 <= 0:
+        print(f"   Invalid tp1={tp1}; skipping TP1 order.")
+        return
+
+    if tp1_fraction <= 0:
+        print(f"   TP1_FRACTION={tp1_fraction} <= 0; skipping TP1 order.")
+        return
+
+    # Calcula quantidade para TP1
+    tp1_qty_raw = total_qty * tp1_fraction
+    tp1_qty = quantize_to_step(tp1_qty_raw, step_size)
+
+    # Não pode ser maior que a qty total
+    if tp1_qty > total_qty:
+        tp1_qty = total_qty
+
+    if tp1_qty < min_qty:
+        print(
+            f"   Computed TP1 qty {tp1_qty} < min_qty {min_qty}; skipping TP1 order."
+        )
+        return
+
+    tp1_base_params: Dict[str, Any] = {
+        "type": "TAKE_PROFIT_MARKET",
+        "stopPrice": str(tp1),
+        "reduceOnly": True,
+        "workingType": "CONTRACT_PRICE",
+        "positionSide": "BOTH",
+    }
+
+    print(
+        f"   Sending TAKE_PROFIT_MARKET (TP1) qty≈{format_quantity(tp1_qty, qty_decimals)}, "
+        f"price={tp1} ..."
+    )
+    tp1_resp = send_order_with_precision_retries(
+        symbol=symbol,
+        side=side_close,
+        base_params=tp1_base_params,
+        qty=tp1_qty,
+        qty_decimals=qty_decimals,
+    )
+    print("   TP1 response:")
+    print(tp1_resp)
 
 
 # -----------------------------------------------------------------------------
@@ -497,6 +601,7 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
     print(f"  status    : {signal.get('status')}")
     print(f"  entry     : {signal.get('entry')}")
     print(f"  stop_loss : {signal.get('stop_loss')}")
+    print(f"  tp1       : {signal.get('tp1')}")
 
     return signal
 
@@ -520,11 +625,21 @@ def main() -> None:
             entry = Decimal(str(signal["entry"]))
             stop_loss = Decimal(str(signal["stop_loss"]))
 
+            tp1_val = signal.get("tp1")
+            tp1: Optional[Decimal]
+            if tp1_val is None:
+                tp1 = None
+            else:
+                tp1 = Decimal(str(tp1_val))
+
             futures_symbol = normalize_futures_symbol(symbol_spot)
             print(f"-> Normalized futures symbol: {futures_symbol}")
 
             print(f"-> Fetching symbol filters from {ENV_LABEL}...")
             min_qty, step_size, qty_decimals = get_symbol_filters(futures_symbol)
+
+            # Garantir ISOLATED 1x antes de abrir posição
+            ensure_isolated_1x(futures_symbol)
 
             print(f"-> Fetching {FUTURES_BALANCE_ASSET} futures balance from {ENV_LABEL}...")
             balance = get_futures_balance(FUTURES_BALANCE_ASSET)
@@ -572,6 +687,7 @@ def main() -> None:
             print(f"Side      : {direction}")
             print(f"Entry     : {entry}")
             print(f"Stop Loss : {stop_loss}")
+            print(f"TP1       : {tp1 if tp1 is not None else 'N/A'}")
             print(f"Quantity  : {qty_str}")
             print("=======================================")
 
@@ -602,7 +718,7 @@ def main() -> None:
                 try:
                     order_id = int(order_id)
                 except Exception:
-                    print("-> Não consegui obter orderId válido; não envio SL.")
+                    print("-> Não consegui obter orderId válido; não envio SL/TP1.")
                     time.sleep(5)
                     continue
 
@@ -633,14 +749,16 @@ def main() -> None:
                         f"executedQty {executed_qty} ajustada à step_size ficou <= 0."
                     )
 
-            print(f"-> Effective filled qty for SL: {effective_qty}")
+            print(f"-> Effective filled qty for SL/TP1: {effective_qty}")
 
-            # Enviar ordem de SL com a qty efetivamente executada
-            place_sl_order(
+            # Enviar ordens de SL + TP1 com a qty efetivamente executada
+            place_sl_and_tp1_orders(
                 symbol=futures_symbol,
                 side_entry=direction,
                 qty=effective_qty,
                 stop_loss=stop_loss,
+                tp1=tp1,
+                tp1_fraction=TP1_FRACTION,
                 step_size=step_size,
                 min_qty=min_qty,
                 qty_decimals=qty_decimals,
