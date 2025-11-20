@@ -19,10 +19,17 @@ Lógica:
                  - exit_time (timestamp do último trade de fecho)
                  - total_profit_usd (soma de realizedPnl dos trades dessa janela)
                  - profit_pct e r_multiple (usando entry e stop_pct do sinal)
+            -> Usa também os orderId guardados no sinal:
+                 - futures_sl_order_id
+                 - futures_tp1_order_id
+                 - futures_tp2_order_id
+                 - futures_tp3_order_id
+               para decidir exit_type/exit_level:
+                 'tp3' > 'tp2' > 'tp1' > 'sl' > 'manual'
             -> Atualiza a linha em 'signals':
                  status='closed', finalized=true,
                  exit_at, avg_exit_price, profit_pct, r_multiple, total_profit_usd,
-                 exit_type/exit_level ('sl' ou 'manual', heurística pelo preço).
+                 exit_type, exit_level, hit_level.
 
 ENV necessários:
 
@@ -78,7 +85,7 @@ REQUEST_TIMEOUT = 10
 
 
 # --------------------------------------------------------------------------
-# Helpers gerais
+# Helpers gerais Binance
 # --------------------------------------------------------------------------
 def signed_request(method: str, path: str, params: Dict[str, Any]) -> requests.Response:
     """
@@ -151,7 +158,7 @@ def normalize_futures_symbol(spot_symbol: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Binance: posição e trades
+# Binance: posição, trades e ordens
 # --------------------------------------------------------------------------
 def is_position_open(symbol: str) -> bool:
     """
@@ -203,6 +210,78 @@ def fetch_user_trades_since(symbol: str, start_time_ms: int) -> List[Dict[str, A
     return trades
 
 
+def fetch_order_status(symbol: str, order_id: Any) -> Optional[str]:
+    """
+    Vai buscar a ordem por orderId em /fapi/v1/order e devolve o status (FILLED, NEW, etc.).
+    Se não existir ou der erro -2013, devolve None.
+    """
+    if order_id is None:
+        return None
+
+    try:
+        # Binance aceita string ou int; enviamos como está.
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "orderId": int(order_id),
+        }
+    except Exception:
+        # Se não der para converter, tenta mesmo assim
+        params = {
+            "symbol": symbol,
+            "orderId": order_id,
+        }
+
+    try:
+        resp = signed_request("GET", "/fapi/v1/order", params)
+        data = resp.json()
+        status = data.get("status")
+        print(f"   Order {order_id} on {symbol} -> status={status}")
+        return status
+    except requests.exceptions.HTTPError as e:
+        r = getattr(e, "response", None)
+        txt = r.text if r is not None else ""
+        if "-2013" in txt or "Order does not exist" in txt:
+            print(f"   Order {order_id} does not exist or not found on {symbol}.")
+            return None
+        print(f"   Error fetching order {order_id} on {symbol}: {txt}")
+        raise
+
+
+def infer_exit_from_orders(symbol: str, signal: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Usa os futures_*_order_id do sinal para inferir exit_type/exit_level.
+    Prioridade: tp3 > tp2 > tp1 > sl > manual
+    Retorna (exit_type, exit_level).
+    """
+    sl_id = signal.get("futures_sl_order_id")
+    tp1_id = signal.get("futures_tp1_order_id")
+    tp2_id = signal.get("futures_tp2_order_id")
+    tp3_id = signal.get("futures_tp3_order_id")
+
+    sl_status = fetch_order_status(symbol, sl_id) if sl_id else None
+    tp1_status = fetch_order_status(symbol, tp1_id) if tp1_id else None
+    tp2_status = fetch_order_status(symbol, tp2_id) if tp2_id else None
+    tp3_status = fetch_order_status(symbol, tp3_id) if tp3_id else None
+
+    sl_filled = sl_status == "FILLED"
+    tp1_filled = tp1_status == "FILLED"
+    tp2_filled = tp2_status == "FILLED"
+    tp3_filled = tp3_status == "FILLED"
+
+    # Prioridade: maior TP atingido ganha
+    if tp3_filled:
+        return "tp", "tp3"
+    if tp2_filled:
+        return "tp", "tp2"
+    if tp1_filled:
+        return "tp", "tp1"
+    if sl_filled:
+        return "sl", "sl"
+
+    # Se nenhuma das ordens conhecidas foi FILLED
+    return "manual", "manual"
+
+
 # --------------------------------------------------------------------------
 # Cálculo de fecho (exit_price, PnL, etc.)
 # --------------------------------------------------------------------------
@@ -221,7 +300,8 @@ def compute_exit_from_trades(
       - total_profit_usd (soma realizedPnl)
       - profit_pct
       - r_multiple
-      - exit_type ('sl' ou 'manual', heurística)
+      - exit_type/exit_level (heurística de SL por preço; depois pode ser
+        sobrescrito pela inferência via orders).
     """
     if not trades:
         return None
@@ -270,7 +350,7 @@ def compute_exit_from_trades(
         last_price = Decimal(str(closes[-1].get("price", "0")))
         exit_price = last_price
 
-    # profit_pct
+    # profit_pct (fração, ex: 0.01 = 1%)
     if direction == "BUY":
         profit_pct = (exit_price - entry_price) / entry_price
     else:
@@ -294,7 +374,7 @@ def compute_exit_from_trades(
     else:
         r_multiple = None
 
-    # exit_type heurístico
+    # exit_type heurístico (fallback; pode ser sobrescrito pelos orders)
     exit_type = "manual"
     exit_level = "manual"
 
@@ -367,6 +447,7 @@ def update_signal_closed(
         "status": "closed",
         "exit_at": exit_at_iso,
         "exit_level": exit_level,
+        "hit_level": exit_level,  # conveniência: mesmo valor
         "avg_exit_price": float(exit_price),
         "total_profit_usd": float(total_profit_usd),
         "profit_pct": float(profit_pct),
@@ -447,7 +528,7 @@ def main() -> None:
                         )
                         continue
 
-                    # 3) Calcular métricas de fecho
+                    # 3) Calcular métricas de fecho via trades
                     exit_info = compute_exit_from_trades(
                         trades=trades,
                         direction=direction,
@@ -460,14 +541,28 @@ def main() -> None:
                         print("   Could not compute exit_info, skipping.")
                         continue
 
+                    # 4) Refinar exit_type/exit_level com base nos orderId (SL/TP1/TP2/TP3)
+                    print("-> Inferring exit_type/exit_level from order IDs...")
+                    ord_exit_type, ord_exit_level = infer_exit_from_orders(
+                        futures_symbol, signal
+                    )
+
+                    # Se os orders indicarem algo mais específico que 'manual', usamos isso
+                    if ord_exit_type != "manual" or ord_exit_level != "manual":
+                        exit_info["exit_type"] = ord_exit_type
+                        exit_info["exit_level"] = ord_exit_level
+
                     print("   Exit info computed:")
                     print(f"      exit_price       : {exit_info['exit_price']}")
                     print(f"      profit_pct       : {exit_info['profit_pct']}")
                     print(f"      r_multiple       : {exit_info['r_multiple']}")
                     print(f"      total_profit_usd : {exit_info['total_profit_usd']}")
-                    print(f"      exit_type/level  : {exit_info['exit_type']}/{exit_info['exit_level']}")
+                    print(
+                        f"      exit_type/level  : {exit_info['exit_type']}/"
+                        f"{exit_info['exit_level']}"
+                    )
 
-                    # 4) Atualizar Supabase
+                    # 5) Atualizar Supabase
                     update_signal_closed(sig_id, exit_info)
 
                 except Exception as e_sig:
