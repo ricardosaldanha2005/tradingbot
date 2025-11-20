@@ -8,7 +8,7 @@ calculando a quantidade com base no risco por trade e no stop loss.
 
 Depois de a ordem de entrada ser preenchida, cria automaticamente:
 - 1 STOP_MARKET de Stop Loss (quantity fixa + reduceOnly=True)
-- 1 TAKE_PROFIT_MARKET (TP1) opcional, se o sinal tiver tp1
+- até 3 TAKE_PROFIT_MARKET (TP1, TP2, TP3) opcionais, se o sinal tiver tp1/tp2/tp3
 
 Este script corre em loop:
 - procura sinais com status='open' e futures_entry_sent=false
@@ -32,7 +32,10 @@ ENV necessários:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
   DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
   MAX_FUTURES_NOTIONAL_USDT=1500    # notional máximo por trade (USDT). Opcional.
-  TP1_FRACTION=1.0                  # fração da quantidade total para o TP1 (0.5 = metade, 1.0 = tudo)
+
+  TP1_FRACTION=0.33                 # fração da quantidade total para o TP1
+  TP2_FRACTION=0.33                 # fração da quantidade total para o TP2
+  TP3_FRACTION=0.34                 # fração da quantidade total para o TP3
 """
 
 import os
@@ -72,7 +75,10 @@ RISK_PER_TRADE_PCT = Decimal(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 FUTURES_BALANCE_ASSET = os.getenv("FUTURES_BALANCE_ASSET", "USDT")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 MAX_FUTURES_NOTIONAL_USDT = os.getenv("MAX_FUTURES_NOTIONAL_USDT")
-TP1_FRACTION = Decimal(os.getenv("TP1_FRACTION", "1.0"))
+
+TP1_FRACTION = Decimal(os.getenv("TP1_FRACTION", "0.33"))
+TP2_FRACTION = Decimal(os.getenv("TP2_FRACTION", "0.33"))
+TP3_FRACTION = Decimal(os.getenv("TP3_FRACTION", "0.34"))
 
 # Timeout de requests para a Binance
 REQUEST_TIMEOUT = 10
@@ -373,12 +379,12 @@ def wait_for_fill(
             return data
 
         if status in ("CANCELED", "REJECTED", "EXPIRED", "PENDING_CANCEL"):
-            print(f"-> Entry order ended with status={status}, aborting SL/TP1.")
+            print(f"-> Entry order ended with status={status}, aborting SL/TPs.")
             return None
 
         time.sleep(poll_interval_s)
 
-    print("-> Timeout waiting for fill; SL/TP1 orders NOT sent.")
+    print("-> Timeout waiting for fill; SL/TP orders NOT sent.")
     return None
 
 
@@ -460,25 +466,31 @@ def send_market_order_with_precision_retries(
 
 
 # -----------------------------------------------------------------------------
-# SL + TP1
+# SL + TP1/TP2/TP3
 # -----------------------------------------------------------------------------
-def place_sl_and_tp1_orders(
+def place_sl_and_tp_orders(
     symbol: str,
     side_entry: str,
     qty: Decimal,
     stop_loss: Decimal,
     tp1: Optional[Decimal],
+    tp2: Optional[Decimal],
+    tp3: Optional[Decimal],
     tp1_fraction: Decimal,
+    tp2_fraction: Decimal,
+    tp3_fraction: Decimal,
     step_size: Decimal,
     min_qty: Decimal,
     qty_decimals: int,
-) -> None:
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
     """
     Cria:
       - 1 STOP_MARKET de SL (quantity = qty total, reduceOnly=True)
-      - 1 TAKE_PROFIT_MARKET (TP1) opcional, com quantity proporcional (tp1_fraction)
+      - até 3 TAKE_PROFIT_MARKET (TP1, TP2, TP3) opcionais
 
     Ambos em reduceOnly, positionSide=BOTH.
+
+    Devolve: (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id)
     """
     side_entry = side_entry.upper()
     if side_entry not in ("BUY", "SELL"):
@@ -486,13 +498,13 @@ def place_sl_and_tp1_orders(
 
     side_close = "SELL" if side_entry == "BUY" else "BUY"
 
-    print("-> Placing SL + TP1 orders...")
+    print("-> Placing SL + TP orders...")
 
-    # Ajustar a qty total à step_size por segurança
+    # Ajustar qty total à step_size
     total_qty = quantize_to_step(qty, step_size)
     if total_qty < min_qty:
         raise ValueError(
-            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TP1."
+            f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TPs."
         )
 
     # STOP LOSS (sempre full size)
@@ -518,54 +530,100 @@ def place_sl_and_tp1_orders(
     print("   SL response:")
     print(sl_resp)
 
-    # TP1 opcional
-    if tp1 is None:
-        print("   No tp1 in signal; skipping TP1 order.")
-        return
+    sl_order_id: Optional[int] = None
+    try:
+        sl_order_id = int(sl_resp.get("orderId"))
+    except Exception:
+        sl_order_id = None
 
-    if tp1 <= 0:
-        print(f"   Invalid tp1={tp1}; skipping TP1 order.")
-        return
+    # ---- Frações de TP (normalização básica) ----
+    f1 = max(tp1_fraction, Decimal("0"))
+    f2 = max(tp2_fraction, Decimal("0"))
+    f3 = max(tp3_fraction, Decimal("0"))
+    sum_f = f1 + f2 + f3
 
-    if tp1_fraction <= 0:
-        print(f"   TP1_FRACTION={tp1_fraction} <= 0; skipping TP1 order.")
-        return
+    if sum_f > Decimal("1"):
+        print(f"   TP fractions sum to {sum_f} > 1; normalizing para somar 1.")
+        factor = Decimal("1") / sum_f
+        f1 *= factor
+        f2 *= factor
+        f3 *= factor
 
-    # Calcula quantidade para TP1
-    tp1_qty_raw = total_qty * tp1_fraction
-    tp1_qty = quantize_to_step(tp1_qty_raw, step_size)
+    # Vamos alocar qty sequencialmente para TP1 -> TP2 -> TP3
+    remaining_qty = total_qty
 
-    # Não pode ser maior que a qty total
-    if tp1_qty > total_qty:
-        tp1_qty = total_qty
+    def make_tp(
+        label: str,
+        tp_price: Optional[Decimal],
+        frac: Decimal,
+        remaining: Decimal,
+    ) -> Tuple[Optional[int], Decimal]:
+        if tp_price is None:
+            print(f"   No {label} in signal; skipping {label} order.")
+            return None, remaining
+        if tp_price <= 0:
+            print(f"   Invalid {label}={tp_price}; skipping {label} order.")
+            return None, remaining
+        if frac <= 0:
+            print(f"   {label}_FRACTION={frac} <= 0; skipping {label} order.")
+            return None, remaining
+        if remaining <= 0:
+            print(f"   No remaining qty for {label}; skipping.")
+            return None, remaining
 
-    if tp1_qty < min_qty:
+        raw_qty = total_qty * frac
+        tp_qty = quantize_to_step(raw_qty, step_size)
+
+        # Não pode exceder o remaining_qty
+        if tp_qty > remaining:
+            tp_qty = quantize_to_step(remaining, step_size)
+
+        if tp_qty < min_qty:
+            print(
+                f"   Computed {label} qty {tp_qty} < min_qty {min_qty}; skipping {label} order."
+            )
+            return None, remaining
+
+        base_params: Dict[str, Any] = {
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": str(tp_price),
+            "reduceOnly": True,
+            "workingType": "CONTRACT_PRICE",
+            "positionSide": "BOTH",
+        }
+
         print(
-            f"   Computed TP1 qty {tp1_qty} < min_qty {min_qty}; skipping TP1 order."
+            f"   Sending TAKE_PROFIT_MARKET ({label}) qty≈{format_quantity(tp_qty, qty_decimals)}, "
+            f"price={tp_price} ..."
         )
-        return
+        resp = send_order_with_precision_retries(
+            symbol=symbol,
+            side=side_close,
+            base_params=base_params,
+            qty=tp_qty,
+            qty_decimals=qty_decimals,
+        )
+        print(f"   {label} response:")
+        print(resp)
 
-    tp1_base_params: Dict[str, Any] = {
-        "type": "TAKE_PROFIT_MARKET",
-        "stopPrice": str(tp1),
-        "reduceOnly": True,
-        "workingType": "CONTRACT_PRICE",
-        "positionSide": "BOTH",
-    }
+        order_id: Optional[int] = None
+        try:
+            order_id = int(resp.get("orderId"))
+        except Exception:
+            order_id = None
 
-    print(
-        f"   Sending TAKE_PROFIT_MARKET (TP1) qty≈{format_quantity(tp1_qty, qty_decimals)}, "
-        f"price={tp1} ..."
-    )
-    tp1_resp = send_order_with_precision_retries(
-        symbol=symbol,
-        side=side_close,
-        base_params=tp1_base_params,
-        qty=tp1_qty,
-        qty_decimals=qty_decimals,
-    )
-    print("   TP1 response:")
-    print(tp1_resp)
+        new_remaining = remaining - tp_qty
+        return order_id, new_remaining
+
+    tp1_order_id: Optional[int]
+    tp2_order_id: Optional[int]
+    tp3_order_id: Optional[int]
+
+    tp1_order_id, remaining_qty = make_tp("TP1", tp1, f1, remaining_qty)
+    tp2_order_id, remaining_qty = make_tp("TP2", tp2, f2, remaining_qty)
+    tp3_order_id, remaining_qty = make_tp("TP3", tp3, f3, remaining_qty)
+
+    return sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id
 
 
 # -----------------------------------------------------------------------------
@@ -602,6 +660,8 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
     print(f"  entry     : {signal.get('entry')}")
     print(f"  stop_loss : {signal.get('stop_loss')}")
     print(f"  tp1       : {signal.get('tp1')}")
+    print(f"  tp2       : {signal.get('tp2')}")
+    print(f"  tp3       : {signal.get('tp3')}")
 
     return signal
 
@@ -626,11 +686,12 @@ def main() -> None:
             stop_loss = Decimal(str(signal["stop_loss"]))
 
             tp1_val = signal.get("tp1")
-            tp1: Optional[Decimal]
-            if tp1_val is None:
-                tp1 = None
-            else:
-                tp1 = Decimal(str(tp1_val))
+            tp2_val = signal.get("tp2")
+            tp3_val = signal.get("tp3")
+
+            tp1: Optional[Decimal] = Decimal(str(tp1_val)) if tp1_val is not None else None
+            tp2: Optional[Decimal] = Decimal(str(tp2_val)) if tp2_val is not None else None
+            tp3: Optional[Decimal] = Decimal(str(tp3_val)) if tp3_val is not None else None
 
             futures_symbol = normalize_futures_symbol(symbol_spot)
             print(f"-> Normalized futures symbol: {futures_symbol}")
@@ -688,6 +749,8 @@ def main() -> None:
             print(f"Entry     : {entry}")
             print(f"Stop Loss : {stop_loss}")
             print(f"TP1       : {tp1 if tp1 is not None else 'N/A'}")
+            print(f"TP2       : {tp2 if tp2 is not None else 'N/A'}")
+            print(f"TP3       : {tp3 if tp3 is not None else 'N/A'}")
             print(f"Quantity  : {qty_str}")
             print("=======================================")
 
@@ -718,7 +781,7 @@ def main() -> None:
                 try:
                     order_id = int(order_id)
                 except Exception:
-                    print("-> Não consegui obter orderId válido; não envio SL/TP1.")
+                    print("-> Não consegui obter orderId válido; não envio SL/TPs.")
                     time.sleep(5)
                     continue
 
@@ -749,30 +812,45 @@ def main() -> None:
                         f"executedQty {executed_qty} ajustada à step_size ficou <= 0."
                     )
 
-            print(f"-> Effective filled qty for SL/TP1: {effective_qty}")
+            print(f"-> Effective filled qty for SL/TPs: {effective_qty}")
 
-            # Enviar ordens de SL + TP1 com a qty efetivamente executada
-            place_sl_and_tp1_orders(
+            # Enviar ordens de SL + TP1/TP2/TP3 com a qty efetivamente executada
+            sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id = place_sl_and_tp_orders(
                 symbol=futures_symbol,
                 side_entry=direction,
                 qty=effective_qty,
                 stop_loss=stop_loss,
                 tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
                 tp1_fraction=TP1_FRACTION,
+                tp2_fraction=TP2_FRACTION,
+                tp3_fraction=TP3_FRACTION,
                 step_size=step_size,
                 min_qty=min_qty,
                 qty_decimals=qty_decimals,
             )
 
             # Atualizar o sinal no Supabase
-            SUPABASE.table(SIGNALS_TABLE).update(
-                {
-                    "futures_entry_sent": True,
-                    "futures_symbol": futures_symbol,
-                    "futures_entry_order_id": order_id,
-                    "futures_entry_status": filled_data.get("status", "FILLED"),
-                }
-            ).eq("id", signal["id"]).execute()
+            update_payload: Dict[str, Any] = {
+                "futures_entry_sent": True,
+                "futures_symbol": futures_symbol,
+                "futures_entry_order_id": order_id,
+                "futures_entry_status": filled_data.get("status", "FILLED"),
+            }
+
+            if sl_order_id is not None:
+                update_payload["futures_sl_order_id"] = sl_order_id
+            if tp1_order_id is not None:
+                update_payload["futures_tp1_order_id"] = tp1_order_id
+            if tp2_order_id is not None:
+                update_payload["futures_tp2_order_id"] = tp2_order_id
+            if tp3_order_id is not None:
+                update_payload["futures_tp3_order_id"] = tp3_order_id
+
+            SUPABASE.table(SIGNALS_TABLE).update(update_payload)\
+                .eq("id", signal["id"]).execute()
+
             print(f"-> Marked signal {signal['id']} as futures_entry_sent=true.")
 
         except Exception as e:
