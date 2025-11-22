@@ -219,13 +219,11 @@ def fetch_order_status(symbol: str, order_id: Any) -> Optional[str]:
         return None
 
     try:
-        # Binance aceita string ou int; enviamos como está.
         params: Dict[str, Any] = {
             "symbol": symbol,
             "orderId": int(order_id),
         }
     except Exception:
-        # Se não der para converter, tenta mesmo assim
         params = {
             "symbol": symbol,
             "orderId": order_id,
@@ -282,7 +280,6 @@ def infer_exit_from_orders(symbol: str, signal: Dict[str, Any]) -> Tuple[str, st
     tp2_filled = tp2_status == "FILLED"
     tp3_filled = tp3_status == "FILLED"
 
-    # Prioridade: maior TP atingido ganha
     if tp3_filled:
         return "tp", "tp3"
     if tp2_filled:
@@ -292,7 +289,6 @@ def infer_exit_from_orders(symbol: str, signal: Dict[str, Any]) -> Tuple[str, st
     if sl_filled:
         return "sl", "sl"
 
-    # Se nenhuma das ordens conhecidas foi FILLED
     return "manual", "manual"
 
 
@@ -330,10 +326,8 @@ def compute_exit_from_trades(
     ]
 
     if not closes:
-        # Não há trades de fecho claros -> fallback: usar último trade
         closes = [trades[-1]]
 
-    # VWAP dos trades de fecho
     vwap_num = Decimal("0")
     qty_sum = Decimal("0")
     exit_time_ms = 0
@@ -362,13 +356,11 @@ def compute_exit_from_trades(
         last_price = Decimal(str(closes[-1].get("price", "0")))
         exit_price = last_price
 
-    # profit_pct (fração, ex: 0.01 = 1% = 1%)
     if direction == "BUY":
         profit_pct = (exit_price - entry_price) / entry_price
     else:
         profit_pct = (entry_price - exit_price) / entry_price
 
-    # stop_pct: usar o que vem do sinal; se não houver, calcula
     if stop_pct is None or stop_pct <= 0:
         if stop_loss is not None and stop_loss > 0:
             if direction == "BUY":
@@ -386,12 +378,10 @@ def compute_exit_from_trades(
     else:
         r_multiple = None
 
-    # exit_type heurístico (fallback; pode ser sobrescrito pelos orders)
     exit_type = "manual"
     exit_level = "manual"
 
     if stop_loss is not None and stop_loss > 0:
-        # tolerância de 0.2% do entry para considerar SL
         tolerance = entry_price * Decimal("0.002")
         if abs(exit_price - stop_loss) <= tolerance:
             exit_type = "sl"
@@ -446,7 +436,8 @@ def update_signal_closed(
     Atualiza o sinal para 'closed' com os dados de fecho.
     Garante que exit_level respeita o check constraint da tabela:
       - só aceita NULL, 'sl', 'tp1', 'tp2', 'tp3'
-      - 'manual' NUNCA vai para exit_level (fica só em exit_type).
+      - 'manual' NUNCA vai para exit_level (fica só em exit_type / hit_level).
+    Para status='closed', assegura também que hit_level não fica NULL.
     """
     exit_price: Decimal = exit_info["exit_price"]
     exit_time_ms: int = exit_info["exit_time_ms"]
@@ -456,15 +447,11 @@ def update_signal_closed(
     exit_type_raw: str = exit_info["exit_type"]
     exit_level_raw: str = exit_info["exit_level"]
 
-    # Normalizar
     exit_type = (exit_type_raw or "").lower()
     exit_level = (exit_level_raw or "").lower() if exit_level_raw is not None else None
 
     valid_levels = {"sl", "tp1", "tp2", "tp3"}
 
-    # Regra:
-    # - se exit_type == 'manual' -> exit_level = NULL
-    # - se exit_level não for um dos válidos -> exit_level = NULL
     if exit_type == "manual":
         exit_level_norm = None
     else:
@@ -473,13 +460,20 @@ def update_signal_closed(
         else:
             exit_level_norm = None
 
+    if exit_level_norm is not None:
+        hit_level = exit_level_norm
+    elif exit_type == "manual":
+        hit_level = "manual"
+    else:
+        hit_level = None
+
     exit_at_iso = dt.datetime.utcfromtimestamp(exit_time_ms / 1000.0).isoformat() + "Z"
 
     update_payload: Dict[str, Any] = {
         "status": "closed",
         "exit_at": exit_at_iso,
         "exit_level": exit_level_norm,
-        "hit_level": exit_level_norm,  # conveniência: mesmo valor, ou NULL
+        "hit_level": hit_level,
         "avg_exit_price": float(exit_price),
         "total_profit_usd": float(total_profit_usd),
         "profit_pct": float(profit_pct),
@@ -538,7 +532,6 @@ def main() -> None:
                     print(f"  entry     : {entry}")
                     print(f"  stop_loss : {stop_loss}")
 
-                    # 1) Verificar se ainda há posição aberta
                     print(
                         f"-> Checking position on {futures_symbol} in {ENV_LABEL} (positionRisk)..."
                     )
@@ -548,7 +541,6 @@ def main() -> None:
 
                     print("   No open position detected -> trade appears CLOSED on Binance.")
 
-                    # 2) Buscar trades desde created_at
                     print("-> Fetching userTrades since signal creation...")
                     trades = fetch_user_trades_since(futures_symbol, created_ms)
                     print(f"   Retrieved {len(trades)} trades.")
@@ -560,7 +552,6 @@ def main() -> None:
                         )
                         continue
 
-                    # 3) Calcular métricas de fecho via trades
                     exit_info = compute_exit_from_trades(
                         trades=trades,
                         direction=direction,
@@ -573,13 +564,11 @@ def main() -> None:
                         print("   Could not compute exit_info, skipping.")
                         continue
 
-                    # 4) Refinar exit_type/exit_level com base nos orderId (SL/TP1/TP2/TP3)
                     print("-> Inferring exit_type/exit_level from order IDs...")
                     ord_exit_type, ord_exit_level = infer_exit_from_orders(
                         futures_symbol, signal
                     )
 
-                    # Se os orders indicarem algo mais específico que 'manual', usamos isso
                     if ord_exit_type != "manual" or ord_exit_level != "manual":
                         exit_info["exit_type"] = ord_exit_type
                         exit_info["exit_level"] = ord_exit_level
@@ -594,12 +583,10 @@ def main() -> None:
                         f"{exit_info['exit_level']}"
                     )
 
-                    # 5) Atualizar Supabase (com validação de exit_level)
                     update_signal_closed(sig_id, exit_info)
 
                 except Exception as e_sig:
                     print(f"Error processing signal {signal.get('id')}: {e_sig}")
-                    # continua com o próximo sinal
 
         except Exception as e:
             print(f"[FATAL LOOP ERROR] {e}")
