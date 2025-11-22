@@ -14,6 +14,7 @@ Este script corre em loop:
 - procura sinais com status='open' e futures_entry_sent=false
 - processa 1 sinal de cada vez
 - no fim marca futures_entry_sent=true para não voltar a repetir o mesmo sinal
+- periodicamente limpa SL/TPs reduceOnly de símbolos sem posição ativa
 
 ENV necessários:
 
@@ -28,14 +29,21 @@ ENV necessários:
 
   RISK_PER_TRADE_PCT=0.5            # percentagem da banca arriscada por trade (ex: 0.5)
 
-  # Opcional:
+  # Gestão de saldo:
   FUTURES_BALANCE_ASSET=USDT        # ativo base da conta futures, default 'USDT'
+  FUTURES_BALANCE_USE_AVAILABLE=1   # 1 = usar availableBalance, 0 = usar balance/walletBalance
+  MIN_FUTURES_BALANCE_USDT=0        # se >0 e saldo < min, não abre posição (mantém sinal pendente)
+
   DRY_RUN=0                         # 1 = não envia ordem, só mostra (mas marca o sinal como tratado)
   MAX_FUTURES_NOTIONAL_USDT=1500    # notional máximo por trade (USDT). Opcional.
 
   TP1_FRACTION=0.33                 # fração da quantidade total para o TP1
   TP2_FRACTION=0.33                 # fração da quantidade total para o TP2
   TP3_FRACTION=0.34                 # fração da quantidade total para o TP3
+
+  # Limpeza de SL/TP órfãos:
+  CLEANUP_SLTP_ENABLED=1            # 1 = ativa limpeza de SL/TP sem posição, 0 = desativa
+  CLEANUP_INTERVAL_S=60             # intervalo mínimo entre limpezas, em segundos
 """
 
 import os
@@ -43,7 +51,7 @@ import time
 import hmac
 import hashlib
 from decimal import Decimal
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List
 import datetime as dt
 
 import requests
@@ -74,6 +82,8 @@ else:
 
 RISK_PER_TRADE_PCT = Decimal(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 FUTURES_BALANCE_ASSET = os.getenv("FUTURES_BALANCE_ASSET", "USDT")
+FUTURES_BALANCE_USE_AVAILABLE = os.getenv("FUTURES_BALANCE_USE_AVAILABLE", "1") == "1"
+MIN_FUTURES_BALANCE_USDT = Decimal(os.getenv("MIN_FUTURES_BALANCE_USDT", "0"))
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 MAX_FUTURES_NOTIONAL_USDT = os.getenv("MAX_FUTURES_NOTIONAL_USDT")
 
@@ -81,12 +91,15 @@ TP1_FRACTION = Decimal(os.getenv("TP1_FRACTION", "0.33"))
 TP2_FRACTION = Decimal(os.getenv("TP2_FRACTION", "0.33"))
 TP3_FRACTION = Decimal(os.getenv("TP3_FRACTION", "0.34"))
 
+CLEANUP_SLTP_ENABLED = os.getenv("CLEANUP_SLTP_ENABLED", "1") == "1"
+CLEANUP_INTERVAL_S = int(os.getenv("CLEANUP_INTERVAL_S", "60"))
+
 # Timeout de requests para a Binance
 REQUEST_TIMEOUT = 10
 
 
 # -----------------------------------------------------------------------------
-# Helpers Binance (assinatura, requests, filtros, balance)
+# Helpers Binance (assinatura, requests, filtros, balance, posições, limpeza)
 # -----------------------------------------------------------------------------
 def signed_request(method: str, path: str, params: Dict[str, Any]) -> requests.Response:
     """
@@ -191,10 +204,13 @@ def get_symbol_filters(symbol: str) -> Tuple[Decimal, Decimal, int]:
     return min_qty, step_size, qty_decimals
 
 
-def get_futures_balance(asset: str = "USDT") -> Decimal:
+def get_futures_balance(asset: str = "USDT", use_available: bool = False) -> Decimal:
     """
-    Vai buscar o balance (wallet balance) no futures para o asset dado.
+    Vai buscar o balance no futures para o asset dado.
     Usa /fapi/v2/balance.
+
+    Se use_available=True, tenta usar availableBalance (saldo realmente disponível
+    para abrir novas posições). Caso contrário, usa balance/walletBalance.
     """
     path = "/fapi/v2/balance"
     params: Dict[str, Any] = {}
@@ -204,10 +220,24 @@ def get_futures_balance(asset: str = "USDT") -> Decimal:
 
     for entry in data:
         if entry.get("asset") == asset:
-            bal_str = entry.get("balance") or entry.get("walletBalance") or "0"
-            bal = Decimal(bal_str)
-            print(f"  {asset} balance (futures): {bal}")
-            return bal
+            wallet_str = entry.get("balance") or entry.get("walletBalance") or "0"
+            avail_str = entry.get("availableBalance") or "0"
+
+            wallet = Decimal(wallet_str)
+            available = Decimal(avail_str)
+
+            print(f"  {asset} wallet balance (futures)   : {wallet}")
+            print(f"  {asset} availableBalance (futures): {available}")
+
+            if use_available:
+                # Se available for 0 (conta nova, sem posições), cai para wallet.
+                chosen = available if available > 0 else wallet
+                print(f"  -> Using AVAILABLE balance for sizing: {chosen}")
+            else:
+                chosen = wallet
+                print(f"  -> Using WALLET balance for sizing: {chosen}")
+
+            return chosen
 
     print(f"  {asset} balance (futures): 0 (not found)")
     return Decimal("0")
@@ -254,6 +284,110 @@ def ensure_isolated_1x(symbol: str) -> None:
         print("   Error setting leverage to 1x:")
         print("   ", txt)
         raise
+
+
+def get_active_futures_symbols() -> List[str]:
+    """
+    Devolve lista de símbolos futures com posição ativa (positionAmt != 0).
+    Usa /fapi/v2/positionRisk.
+    """
+    path = "/fapi/v2/positionRisk"
+    params: Dict[str, Any] = {}
+
+    resp = signed_request("GET", path, params)
+    data = resp.json()
+
+    active_symbols: List[str] = []
+    for pos in data:
+        try:
+            amt = Decimal(str(pos.get("positionAmt", "0")))
+        except Exception:
+            amt = Decimal("0")
+
+        if amt != 0:
+            sym = pos.get("symbol")
+            if sym:
+                active_symbols.append(sym)
+
+    print(f"-> Active futures symbols (positionAmt != 0): {active_symbols}")
+    return active_symbols
+
+
+def cleanup_stale_sl_tp_orders() -> None:
+    """
+    Limpa ordens SL/TP reduceOnly em símbolos onde NÃO há posição ativa.
+
+    Lógica:
+      - Vai buscar símbolos com posição ativa (positionAmt != 0).
+      - Vai buscar todas as openOrders.
+      - Para cada ordem:
+           se symbol NÃO está na lista de ativos
+           e reduceOnly == true
+           e type em {STOP_MARKET, TAKE_PROFIT_MARKET, STOP, TAKE_PROFIT}
+           -> cancela a ordem.
+    """
+    if not CLEANUP_SLTP_ENABLED:
+        return
+
+    print("-> Cleanup SL/TP: checking for stale reduceOnly orders sem posição ativa...")
+
+    active_symbols = set(get_active_futures_symbols())
+
+    # Buscar todas as openOrders
+    try:
+        resp = signed_request("GET", "/fapi/v1/openOrders", params={})
+    except Exception as e:
+        print(f"   Error fetching openOrders for cleanup: {e}")
+        return
+
+    try:
+        open_orders = resp.json()
+    except Exception:
+        print("   Error parsing openOrders JSON.")
+        return
+
+    if not isinstance(open_orders, list):
+        print("   openOrders response is not a list; nothing to do.")
+        return
+
+    cancelled = 0
+    candidate_types = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"}
+
+    for o in open_orders:
+        sym = o.get("symbol")
+        if not sym:
+            continue
+
+        # Se tiver posição ativa, não mexemos
+        if sym in active_symbols:
+            continue
+
+        # Só limpamos reduceOnly TP/SL
+        reduce_only = o.get("reduceOnly", False)
+        o_type = o.get("type")
+
+        if not reduce_only:
+            continue
+        if o_type not in candidate_types:
+            continue
+
+        order_id = o.get("orderId")
+        print(
+            f"   Cancelling stale {o_type} reduceOnly order {order_id} on {sym} "
+            f"(no active position)."
+        )
+
+        try:
+            signed_request(
+                "DELETE",
+                "/fapi/v1/order",
+                {"symbol": sym, "orderId": order_id},
+            )
+            cancelled += 1
+        except Exception as e:
+            print(f"   Error cancelling order {order_id} on {sym}: {e}")
+
+    print(f"-> Cleanup SL/TP done. Cancelled {cancelled} stale orders.")
 
 
 # -----------------------------------------------------------------------------
@@ -340,8 +474,10 @@ def calculate_position_size(
     qty_str = format_quantity(adj_qty, qty_decimals)
 
     print(f"-> Calculating quantity with RISK_PER_TRADE_PCT={risk_pct}%...")
-    print(f"  raw_qty : {raw_qty}")
-    print(f"  qty     : {qty_str}")
+    print(f"  balance  : {balance}")
+    print(f"  risk_cap : {risk_capital}")
+    print(f"  raw_qty  : {raw_qty}")
+    print(f"  qty      : {qty_str}")
 
     return raw_qty, adj_qty, qty_str
 
@@ -503,7 +639,7 @@ def place_sl_and_tp_orders(
 
     # Ajustar qty total à step_size
     total_qty = quantize_to_step(qty, step_size)
-    if totalQty_lt_min := (total_qty < min_qty):
+    if total_qty < min_qty:
         raise ValueError(
             f"Total qty {total_qty} < min_qty {min_qty}, cannot place SL/TPs."
         )
@@ -668,14 +804,23 @@ def fetch_latest_open_signal() -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# MAIN (loop infinito a processar sinais)
+# MAIN (loop infinito a processar sinais + limpeza periódica)
 # -----------------------------------------------------------------------------
 def main() -> None:
     print("Starting Container")
     print("-> Connecting to Supabase...")
 
+    last_cleanup_ts = 0.0
+
     while True:
         try:
+            # Limpeza periódica de SL/TP órfãos
+            now = time.time()
+            if CLEANUP_SLTP_ENABLED and (now - last_cleanup_ts) >= CLEANUP_INTERVAL_S:
+                cleanup_stale_sl_tp_orders()
+                last_cleanup_ts = now
+
+            # Processar próximo sinal
             signal = fetch_latest_open_signal()
             if not signal:
                 time.sleep(5)
@@ -703,8 +848,23 @@ def main() -> None:
             # Garantir ISOLATED 1x antes de abrir posição
             ensure_isolated_1x(futures_symbol)
 
-            print(f"-> Fetching {FUTURES_BALANCE_ASSET} futures balance from {ENV_LABEL}...")
-            balance = get_futures_balance(FUTURES_BALANCE_ASSET)
+            print(
+                f"-> Fetching {FUTURES_BALANCE_ASSET} futures balance from {ENV_LABEL} "
+                f"(use_available={FUTURES_BALANCE_USE_AVAILABLE})..."
+            )
+            balance = get_futures_balance(
+                asset=FUTURES_BALANCE_ASSET,
+                use_available=FUTURES_BALANCE_USE_AVAILABLE,
+            )
+
+            # Se tiveres um mínimo de saldo exigido, aborta o trade se estiver abaixo
+            if MIN_FUTURES_BALANCE_USDT > 0 and balance < MIN_FUTURES_BALANCE_USDT:
+                print(
+                    f"-> Balance {balance} {FUTURES_BALANCE_ASSET} < MIN_FUTURES_BALANCE_USDT={MIN_FUTURES_BALANCE_USDT}. "
+                    f"Não vou abrir posição. Sinal mantém-se pendente."
+                )
+                time.sleep(10)
+                continue
 
             raw_qty, adj_qty, qty_str = calculate_position_size(
                 balance=balance,
