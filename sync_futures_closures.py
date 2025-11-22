@@ -438,11 +438,15 @@ def update_signal_closed(
     Regras para bater certo com os CHECK da tabela:
     - exit_level só pode ser NULL, 'sl', 'tp1', 'tp2', 'tp3'
     - Para status='closed', exit_level NÃO pode ser NULL (signals_status_check).
-    - 'manual' NUNCA entra em exit_level, só em exit_type.
+    - 'manual' NUNCA entra em exit_level, só em exit_type (antes de normalizar).
     - Para fechos manuais:
-        * exit_type = 'manual'
-        * exit_level = 'tp1' se profit_pct >= 0, senão 'sl'
-    - hit_level = exit_level (para todos os casos).
+        * se heurística deu 'sl' -> mantemos 'sl'
+        * senão:
+            - exit_level = 'tp1' se profit_pct >= 0
+            - exit_level = 'sl'  se profit_pct < 0
+    - Para satisfazer o signals_exit_level_check:
+        * se exit_level_norm = 'sl'  -> exit_type_db = 'sl'
+        * se exit_level_norm = 'tpX' -> exit_type_db = 'tp'
     """
     exit_price: Decimal = exit_info["exit_price"]
     exit_time_ms: int = exit_info["exit_time_ms"]
@@ -452,30 +456,40 @@ def update_signal_closed(
     exit_type_raw: str = exit_info["exit_type"]
     exit_level_raw: str = exit_info["exit_level"]
 
-    exit_type = (exit_type_raw or "").lower()
-    exit_level = (exit_level_raw or "").lower() if exit_level_raw is not None else None
+    # Tipo/nível “originais” (incluindo manual)
+    exit_type_orig = (exit_type_raw or "").lower()
+    exit_level_orig = (exit_level_raw or "").lower() if exit_level_raw is not None else None
 
     valid_levels = {"sl", "tp1", "tp2", "tp3"}
 
-    # Normalizar exit_level para respeitar constraints
-    if exit_type == "manual":
-        # Se por acaso o heurístico tiver posto 'sl', aceitamo-lo.
-        if exit_level in valid_levels:
-            exit_level_norm = exit_level
+    # 1) Normalizar exit_level
+    if exit_type_orig == "manual":
+        # se por acaso já veio 'sl' da heurística, respeitamos
+        if exit_level_orig in valid_levels:
+            exit_level_norm = exit_level_orig
         else:
-            # Se foi manual e está em lucro -> tp1; se prejuízo -> sl
+            # manual e sem nível consistente -> decidimos pelo resultado
             exit_level_norm = "tp1" if profit_pct >= 0 else "sl"
     else:
-        if exit_level in valid_levels:
-            exit_level_norm = exit_level
+        if exit_level_orig in valid_levels:
+            exit_level_norm = exit_level_orig
         else:
-            # Em teoria, para status='closed' o CHECK não aceita NULL aqui,
-            # mas se não tivermos nada válido, caímos em 'sl' como fallback conservador.
+            # fallback super conservador: sl
             exit_level_norm = "sl"
+
+    # 2) Normalizar exit_type para bater certo com exit_level_norm
+    if exit_level_norm == "sl":
+        exit_type_db = "sl"
+    else:
+        # tp1 / tp2 / tp3
+        exit_type_db = "tp"
 
     hit_level = exit_level_norm
 
-    exit_at_iso = dt.datetime.fromtimestamp(exit_time_ms / 1000.0, dt.timezone.utc).isoformat()
+    # datetime consciente de timezone (evita DeprecationWarning)
+    exit_at_iso = dt.datetime.fromtimestamp(
+        exit_time_ms / 1000.0, tz=dt.timezone.utc
+    ).isoformat()
 
     update_payload: Dict[str, Any] = {
         "status": "closed",
@@ -486,13 +500,17 @@ def update_signal_closed(
         "total_profit_usd": float(total_profit_usd),
         "profit_pct": float(profit_pct),
         "finalized": True,
-        "exit_type": exit_type,
+        "exit_type": exit_type_db,
     }
 
     if r_multiple is not None:
         update_payload["r_multiple"] = float(r_multiple)
 
-    print(f"-> Updating signal {signal_id} as closed in Supabase...")
+    print(
+        f"-> Updating signal {signal_id} as closed in Supabase "
+        f"(orig exit_type={exit_type_orig}, final exit_type={exit_type_db}, "
+        f"exit_level={exit_level_norm})..."
+    )
     SUPABASE.table(SIGNALS_TABLE).update(update_payload).eq("id", signal_id).execute()
     print(f"-> Signal {signal_id} updated.")
 
