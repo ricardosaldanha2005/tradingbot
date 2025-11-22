@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+""" 
 send_futures_entry_from_signal.py
 
 Lê sinais na tabela 'signals' do Supabase e envia
