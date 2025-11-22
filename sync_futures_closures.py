@@ -20,10 +20,10 @@ Lógica:
                  - total_profit_usd (soma de realizedPnl dos trades dessa janela)
                  - profit_pct e r_multiple (usando entry e stop_pct do sinal)
             -> Usa também os orderId guardados no sinal:
-                 - futures_sl_order_id
-                 - futures_tp1_order_id
-                 - futures_tp2_order_id
-                 - futures_tp3_order_id
+                 - binance_sl_order_id / futures_sl_order_id
+                 - binance_tp1_order_id / futures_tp1_order_id
+                 - binance_tp2_order_id / futures_tp2_order_id
+                 - binance_tp3_order_id / futures_tp3_order_id
                para decidir exit_type/exit_level:
                  'tp3' > 'tp2' > 'tp1' > 'sl' > 'manual'
             -> Atualiza a linha em 'signals':
@@ -249,14 +249,28 @@ def fetch_order_status(symbol: str, order_id: Any) -> Optional[str]:
 
 def infer_exit_from_orders(symbol: str, signal: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Usa os futures_*_order_id do sinal para inferir exit_type/exit_level.
+    Usa os order_id do sinal para inferir exit_type/exit_level.
     Prioridade: tp3 > tp2 > tp1 > sl > manual
     Retorna (exit_type, exit_level).
+
+    Tenta primeiro as colunas binance_* (atuais) e cai para futures_* (legacy) se existirem.
     """
-    sl_id = signal.get("futures_sl_order_id")
-    tp1_id = signal.get("futures_tp1_order_id")
-    tp2_id = signal.get("futures_tp2_order_id")
-    tp3_id = signal.get("futures_tp3_order_id")
+    sl_id = (
+        signal.get("binance_sl_order_id")
+        or signal.get("futures_sl_order_id")
+    )
+    tp1_id = (
+        signal.get("binance_tp1_order_id")
+        or signal.get("futures_tp1_order_id")
+    )
+    tp2_id = (
+        signal.get("binance_tp2_order_id")
+        or signal.get("futures_tp2_order_id")
+    )
+    tp3_id = (
+        signal.get("binance_tp3_order_id")
+        or signal.get("futures_tp3_order_id")
+    )
 
     sl_status = fetch_order_status(symbol, sl_id) if sl_id else None
     tp1_status = fetch_order_status(symbol, tp1_id) if tp1_id else None
@@ -300,8 +314,7 @@ def compute_exit_from_trades(
       - total_profit_usd (soma realizedPnl)
       - profit_pct
       - r_multiple
-      - exit_type/exit_level (heurística de SL por preço; depois pode ser
-        sobrescrito pela inferência via orders).
+      - exit_type/exit_level heurísticos (podem ser sobrescritos via orders).
     """
     if not trades:
         return None
@@ -346,11 +359,10 @@ def compute_exit_from_trades(
     if qty_sum > 0:
         exit_price = vwap_num / qty_sum
     else:
-        # fallback extremo
         last_price = Decimal(str(closes[-1].get("price", "0")))
         exit_price = last_price
 
-    # profit_pct (fração, ex: 0.01 = 1%)
+    # profit_pct (fração, ex: 0.01 = 1% = 1%)
     if direction == "BUY":
         profit_pct = (exit_price - entry_price) / entry_price
     else:
@@ -432,22 +444,42 @@ def update_signal_closed(
 ) -> None:
     """
     Atualiza o sinal para 'closed' com os dados de fecho.
+    Garante que exit_level respeita o check constraint da tabela:
+      - só aceita NULL, 'sl', 'tp1', 'tp2', 'tp3'
+      - 'manual' NUNCA vai para exit_level (fica só em exit_type).
     """
     exit_price: Decimal = exit_info["exit_price"]
     exit_time_ms: int = exit_info["exit_time_ms"]
     total_profit_usd: Decimal = exit_info["total_profit_usd"]
     profit_pct: Decimal = exit_info["profit_pct"]
     r_multiple = exit_info["r_multiple"]
-    exit_type: str = exit_info["exit_type"]
-    exit_level: str = exit_info["exit_level"]
+    exit_type_raw: str = exit_info["exit_type"]
+    exit_level_raw: str = exit_info["exit_level"]
+
+    # Normalizar
+    exit_type = (exit_type_raw or "").lower()
+    exit_level = (exit_level_raw or "").lower() if exit_level_raw is not None else None
+
+    valid_levels = {"sl", "tp1", "tp2", "tp3"}
+
+    # Regra:
+    # - se exit_type == 'manual' -> exit_level = NULL
+    # - se exit_level não for um dos válidos -> exit_level = NULL
+    if exit_type == "manual":
+        exit_level_norm = None
+    else:
+        if exit_level in valid_levels:
+            exit_level_norm = exit_level
+        else:
+            exit_level_norm = None
 
     exit_at_iso = dt.datetime.utcfromtimestamp(exit_time_ms / 1000.0).isoformat() + "Z"
 
     update_payload: Dict[str, Any] = {
         "status": "closed",
         "exit_at": exit_at_iso,
-        "exit_level": exit_level,
-        "hit_level": exit_level,  # conveniência: mesmo valor
+        "exit_level": exit_level_norm,
+        "hit_level": exit_level_norm,  # conveniência: mesmo valor, ou NULL
         "avg_exit_price": float(exit_price),
         "total_profit_usd": float(total_profit_usd),
         "profit_pct": float(profit_pct),
@@ -562,7 +594,7 @@ def main() -> None:
                         f"{exit_info['exit_level']}"
                     )
 
-                    # 5) Atualizar Supabase
+                    # 5) Atualizar Supabase (com validação de exit_level)
                     update_signal_closed(sig_id, exit_info)
 
                 except Exception as e_sig:
