@@ -434,10 +434,15 @@ def update_signal_closed(
 ) -> None:
     """
     Atualiza o sinal para 'closed' com os dados de fecho.
-    Garante que exit_level respeita o check constraint da tabela:
-      - só aceita NULL, 'sl', 'tp1', 'tp2', 'tp3'
-      - 'manual' NUNCA vai para exit_level (fica só em exit_type / hit_level).
-    Para status='closed', assegura também que hit_level não fica NULL.
+
+    Regras para bater certo com os CHECK da tabela:
+    - exit_level só pode ser NULL, 'sl', 'tp1', 'tp2', 'tp3'
+    - Para status='closed', exit_level NÃO pode ser NULL (signals_status_check).
+    - 'manual' NUNCA entra em exit_level, só em exit_type.
+    - Para fechos manuais:
+        * exit_type = 'manual'
+        * exit_level = 'tp1' se profit_pct >= 0, senão 'sl'
+    - hit_level = exit_level (para todos os casos).
     """
     exit_price: Decimal = exit_info["exit_price"]
     exit_time_ms: int = exit_info["exit_time_ms"]
@@ -452,22 +457,25 @@ def update_signal_closed(
 
     valid_levels = {"sl", "tp1", "tp2", "tp3"}
 
+    # Normalizar exit_level para respeitar constraints
     if exit_type == "manual":
-        exit_level_norm = None
+        # Se por acaso o heurístico tiver posto 'sl', aceitamo-lo.
+        if exit_level in valid_levels:
+            exit_level_norm = exit_level
+        else:
+            # Se foi manual e está em lucro -> tp1; se prejuízo -> sl
+            exit_level_norm = "tp1" if profit_pct >= 0 else "sl"
     else:
         if exit_level in valid_levels:
             exit_level_norm = exit_level
         else:
-            exit_level_norm = None
+            # Em teoria, para status='closed' o CHECK não aceita NULL aqui,
+            # mas se não tivermos nada válido, caímos em 'sl' como fallback conservador.
+            exit_level_norm = "sl"
 
-    if exit_level_norm is not None:
-        hit_level = exit_level_norm
-    elif exit_type == "manual":
-        hit_level = "manual"
-    else:
-        hit_level = None
+    hit_level = exit_level_norm
 
-    exit_at_iso = dt.datetime.utcfromtimestamp(exit_time_ms / 1000.0).isoformat() + "Z"
+    exit_at_iso = dt.datetime.fromtimestamp(exit_time_ms / 1000.0, dt.timezone.utc).isoformat()
 
     update_payload: Dict[str, Any] = {
         "status": "closed",
