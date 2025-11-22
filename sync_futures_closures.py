@@ -27,7 +27,7 @@ Lógica:
                para decidir exit_type/exit_level:
                  'tp3' > 'tp2' > 'tp1' > 'sl' > 'manual'
             -> Atualiza a linha em 'signals':
-                 status='closed', finalized=true,
+                 status='close', finalized=true,
                  exit_at, avg_exit_price, profit_pct, r_multiple, total_profit_usd,
                  exit_type, exit_level, hit_level.
 
@@ -433,11 +433,12 @@ def update_signal_closed(
     exit_info: Dict[str, Any],
 ) -> None:
     """
-    Atualiza o sinal para 'closed' com os dados de fecho.
+    Atualiza o sinal para 'close' com os dados de fecho.
 
     Regras para bater certo com os CHECK da tabela:
-    - exit_level só pode ser NULL, 'sl', 'tp1', 'tp2', 'tp3'
-    - Para status='closed', exit_level NÃO pode ser NULL (signals_status_check).
+    - status só pode ser 'open','tp1','tp2','tp3','close'
+    - exit_level só pode ser NULL, 'sl', 'tp1', 'tp2', 'tp3', 'be'
+    - Para status='close', exit_level NÃO pode ser NULL.
     - 'manual' NUNCA entra em exit_level, só em exit_type (antes de normalizar).
     - Para fechos manuais:
         * se heurística deu 'sl' -> mantemos 'sl'
@@ -460,7 +461,7 @@ def update_signal_closed(
     exit_type_orig = (exit_type_raw or "").lower()
     exit_level_orig = (exit_level_raw or "").lower() if exit_level_raw is not None else None
 
-    valid_levels = {"sl", "tp1", "tp2", "tp3"}
+    valid_levels = {"sl", "tp1", "tp2", "tp3", "be"}
 
     # 1) Normalizar exit_level
     if exit_type_orig == "manual":
@@ -481,7 +482,7 @@ def update_signal_closed(
     if exit_level_norm == "sl":
         exit_type_db = "sl"
     else:
-        # tp1 / tp2 / tp3
+        # tp1 / tp2 / tp3 / be
         exit_type_db = "tp"
 
     hit_level = exit_level_norm
@@ -492,7 +493,7 @@ def update_signal_closed(
     ).isoformat()
 
     update_payload: Dict[str, Any] = {
-        "status": "closed",
+        "status": "close",          # <- AQUI: 'close', não 'closed'
         "exit_at": exit_at_iso,
         "exit_level": exit_level_norm,
         "hit_level": hit_level,
@@ -507,7 +508,7 @@ def update_signal_closed(
         update_payload["r_multiple"] = float(r_multiple)
 
     print(
-        f"-> Updating signal {signal_id} as closed in Supabase "
+        f"-> Updating signal {signal_id} as close in Supabase "
         f"(orig exit_type={exit_type_orig}, final exit_type={exit_type_db}, "
         f"exit_level={exit_level_norm})..."
     )
